@@ -1821,7 +1821,7 @@ def main():
     t_max=args.t_max
 
 
-    folder=f"./仿真2/"+args.group +"/"
+    folder=f"./仿真/"+args.group +"/"
     if not os.path.exists(folder):
         # os.makedirs() 递归创建多级目录（若「仿真」目录也不存在，会一并创建）
         # exist_ok=True 避免文件夹已存在时抛出异常（可选，增加鲁棒性）
