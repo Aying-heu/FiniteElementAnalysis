@@ -1,0 +1,1990 @@
+import math
+# import plotly.graph_objects as go
+import numpy as np
+# from plotly.subplots import make_subplots
+from math import pi, cos, sin, sqrt
+import time
+import matplotlib.pyplot as plt
+import pyvista as pv
+from scipy.spatial.transform import Rotation as R
+
+
+
+import concurrent.futures
+from functools import partial
+from threading import Lock
+from numba import njit, prange
+import multiprocessing
+
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import hashlib
+from tqdm import tqdm
+# 预生成随机相位数组
+np.random.seed(42)  # 固定随机种子确保结果可重现
+from numba import cuda, float32
+
+TPB = 256 
+@cuda.jit
+def fast_fsi_kernel(
+    # 输入：初始几何信息 (只读，驻留显存)
+    init_points,     # [N, 3] 初始未旋转的顶点
+    face_ids,        # [N] 每个点所属的面ID
+    face_normals,    # [6, 3] 6个面的初始法向量
+    
+    # 输入：当前运动状态 (每帧更新，仅12个float)
+    rot_matrix,      # [3, 3] 旋转矩阵
+    trans_vec,       # [3] 平移向量
+    g_center,        # [3] 当前重心位置
+    
+    # 输入：波浪参数
+    wave_k, wave_omega, wave_theta, wave_amp, wave_phi, 
+    sim_time,        # 当前时间 t
+    
+    # 输入：物理参数
+    rho, g, d_uuv,
+    
+    # 输出：力和力矩
+    out_force,       # [3]
+    out_moment       # [3]
+):
+    # 1. 声明共享内存用于块归约 (Block Reduction)
+    # shared_mem 布局: [TPB, 6] -> 前3个存Fx,Fy,Fz，后3个存Mx,My,Mz
+    s_data = cuda.shared.array((TPB, 6), dtype=float32)
+    
+    # 线程索引
+    tid = cuda.threadIdx.x
+    gid = cuda.grid(1)
+    
+    # 初始化共享内存
+    s_data[tid, 0] = 0.0
+    s_data[tid, 1] = 0.0
+    s_data[tid, 2] = 0.0
+    s_data[tid, 3] = 0.0
+    s_data[tid, 4] = 0.0
+    s_data[tid, 5] = 0.0
+    
+    # 2. 计算几何变换和受力 (每个线程处理一个点)
+    if gid < init_points.shape[0]:
+        # --- A. 几何变换 (Geometry Transformation) ---
+        # 读取初始点
+        p0_x = init_points[gid, 0]
+        p0_y = init_points[gid, 1]
+        p0_z = init_points[gid, 2]
+        
+        # 旋转 (R * p)
+        cur_x = rot_matrix[0,0]*p0_x + rot_matrix[0,1]*p0_y + rot_matrix[0,2]*p0_z
+        cur_y = rot_matrix[1,0]*p0_x + rot_matrix[1,1]*p0_y + rot_matrix[1,2]*p0_z
+        cur_z = rot_matrix[2,0]*p0_x + rot_matrix[2,1]*p0_y + rot_matrix[2,2]*p0_z
+        
+        # 平移 (+ T)
+        cur_x += trans_vec[0]
+        cur_y += trans_vec[1]
+        cur_z += trans_vec[2]
+        
+        # --- B. 计算波高 (Wave Elevation) ---
+        # 直接在此处计算，不读取 global memory
+        eta = 0.0
+        # 循环展开或直接遍历波浪分量
+        for i in range(wave_k.shape[0]): # wave_N
+            k_val = wave_k[i]
+            w_val = wave_omega[i]
+            for j in range(wave_theta.shape[0]): # wave_M
+                theta_val = wave_theta[j]
+                
+                # 相位计算
+                phase = (k_val * (cur_x * math.cos(theta_val) + 
+                                  cur_y * math.sin(theta_val))
+                         - w_val * sim_time 
+                         + wave_phi[i, j])
+                
+                eta += wave_amp[i, j] * math.cos(phase)
+        
+        # --- C. 计算压力和力矩 (Pressure & Force) ---
+        if eta < cur_z: 
+            # 压力深度 = 当前深度 - 波面位置
+            depth = cur_z - eta
+            pressure = rho * g * depth * d_uuv * d_uuv
+            
+            fid = face_ids[gid]
+            n0_x = face_normals[fid, 0]
+            n0_y = face_normals[fid, 1]
+            n0_z = face_normals[fid, 2]
+            
+            # 旋转法向量
+            nx = rot_matrix[0,0]*n0_x + rot_matrix[0,1]*n0_y + rot_matrix[0,2]*n0_z
+            ny = rot_matrix[1,0]*n0_x + rot_matrix[1,1]*n0_y + rot_matrix[1,2]*n0_z
+            nz = rot_matrix[2,0]*n0_x + rot_matrix[2,1]*n0_y + rot_matrix[2,2]*n0_z
+            
+            # --- 关键点：压力方向 ---
+            # 在 Z轴向下坐标系中，计算受力方向需要特别小心
+            # 压力始终垂直于表面指向物体内部。
+            # 如果你的法向量(nx,ny,nz)是指向物体【内部】的：
+            # Force = Pressure * Normal
+            # 如果你的法向量是指向物体【外部】的：
+            # Force = -Pressure * Normal
+            
+            # 之前你说 directions = center - face，这是指向内部的。
+            # 所以这里保持正号
+            fx = pressure * nx
+            fy = pressure * ny
+            fz = pressure * nz
+            
+            # 力矩计算保持不变 (r x F)
+            rx = cur_x - g_center[0]
+            ry = cur_y - g_center[1]
+            rz = cur_z - g_center[2]
+            
+            mx = ry * fz - rz * fy
+            my = rz * fx - rx * fz
+            mz = rx * fy - ry * fx
+            
+            s_data[tid, 0] = fx
+            s_data[tid, 1] = fy
+            s_data[tid, 2] = fz
+            s_data[tid, 3] = mx
+            s_data[tid, 4] = my
+            s_data[tid, 5] = mz
+
+    cuda.syncthreads()
+
+    # --- D. 块内归约 (Parallel Reduction in Shared Memory) ---
+    # 使用二叉树归约法将 s_data[tid] 累加到 s_data[0]
+    stride = TPB // 2
+    while stride > 0:
+        if tid < stride:
+            s_data[tid, 0] += s_data[tid + stride, 0]
+            s_data[tid, 1] += s_data[tid + stride, 1]
+            s_data[tid, 2] += s_data[tid + stride, 2]
+            s_data[tid, 3] += s_data[tid + stride, 3]
+            s_data[tid, 4] += s_data[tid + stride, 4]
+            s_data[tid, 5] += s_data[tid + stride, 5]
+        cuda.syncthreads()
+        stride //= 2
+
+    # --- E. 全局原子加 (只由每个Block的线程0执行) ---
+    if tid == 0:
+        cuda.atomic.add(out_force, 0, s_data[0, 0])
+        cuda.atomic.add(out_force, 1, s_data[0, 1])
+        cuda.atomic.add(out_force, 2, s_data[0, 2])
+        
+        cuda.atomic.add(out_moment, 0, s_data[0, 3])
+        cuda.atomic.add(out_moment, 1, s_data[0, 4])
+        cuda.atomic.add(out_moment, 2, s_data[0, 5])
+
+@cuda.jit
+def simulation_kernel(
+    # --- 初始状态 ---
+    init_state,      # [12] (x,y,z, phi,theta,psi, u,v,w, p,q,r)
+    mass_matrix_inv, # [6, 6] 质量矩阵的逆 (预先在CPU算好传进来!)
+    damping_lin,     # [6] 线性阻尼系数 (对角线简化版)
+    damping_quad,    # [6] 二次阻尼系数
+    
+    # --- 几何 ---
+    init_points,     # [N, 3]
+    face_ids,        # [N]
+    face_normals,    # [6, 3]
+    g_center_local,  # [3] 重心在局部坐标系的位置
+    
+    # --- 波浪 & 环境 ---
+    wave_k, wave_omega, wave_theta, wave_amp, wave_phi,
+    current_force,   # [3] (u, v, w 方向的流力)
+    tau_control,     # [6] 控制力
+    
+    # --- 仿真参数 ---
+    dt,              # 时间步长
+    total_steps,     # 总步数
+    rho, g, d_uuv,
+    
+    # --- 输出 ---
+    out_trajectory   # [total_steps, 13] (t, x, y, z, phi, theta, psi...)
+):
+    # 共享内存：存储当前步的 力 和 力矩
+    # 0-2: Force, 3-5: Moment
+    s_force = cuda.shared.array(6, dtype=float32)
+    # 共享内存：存储当前步的 状态 (12个变量)
+    s_state = cuda.shared.array(12, dtype=float32)
+    # 共享内存：临时变量用于归约
+    s_reduce = cuda.shared.array((TPB, 6), dtype=float32)
+
+    tid = cuda.threadIdx.x
+    gid = cuda.grid(1)
+    
+    # --- 1. 初始化状态 (由线程0负责加载到共享内存) ---
+    if tid < 12:
+        s_state[tid] = init_state[tid]
+    
+    cuda.syncthreads()
+
+    # ====== 时间循环开始 ======
+    for step in range(total_steps):
+        current_time = step * dt
+        
+        # A. 清空受力累加器
+        if tid < 6:
+            s_force[tid] = 0.0
+        
+        # 初始化归约数组
+        s_reduce[tid, 0] = 0.0
+        s_reduce[tid, 1] = 0.0
+        s_reduce[tid, 2] = 0.0
+        s_reduce[tid, 3] = 0.0
+        s_reduce[tid, 4] = 0.0
+        s_reduce[tid, 5] = 0.0
+        
+        cuda.syncthreads() # 确保状态和力都被初始化/清空
+
+        # B. 每个线程计算一部分点的受力 (并行计算 Froude-Krylov)
+        # 读取当前状态 (所有线程都读共享内存，极快)
+        x = s_state[0]; y = s_state[1]; z = s_state[2]
+        phi = s_state[3]; theta = s_state[4]; psi = s_state[5]
+        
+        # 预计算旋转矩阵 (每个线程都要用，或者由线程0算好放在shared里)
+        # 这里为了并行度，每个线程算自己的坐标变换
+        # 构建旋转矩阵 R (ZYX顺序 或 XYZ顺序，需与Python一致)
+        cph, sph = math.cos(phi), math.sin(phi)
+        cth, sth = math.cos(theta), math.sin(theta)
+        cps, sps = math.cos(psi), math.sin(psi)
+        
+        # R = Rz * Ry * Rx (示例)
+        r00 = cps*cth; r01 = cps*sth*sph - sps*cph; r02 = cps*sth*cph + sps*sph
+        r10 = sps*cth; r11 = sps*sth*sph + cps*cph; r12 = sps*sth*cph - cps*sph
+        r20 = -sth;    r21 = cth*sph;               r22 = cth*cph
+
+        # 遍历分配给该线程的点
+        # 假设点数 N > TPB，使用 stride 循环
+        for i in range(tid, init_points.shape[0], TPB):
+            # 1. 坐标变换 Local -> Global
+            p0x, p0y, p0z = init_points[i, 0], init_points[i, 1], init_points[i, 2]
+            
+            # 旋转
+            cur_x = r00*p0x + r01*p0y + r02*p0z + x
+            cur_y = r10*p0x + r11*p0y + r12*p0z + y
+            cur_z = r20*p0x + r21*p0y + r22*p0z + z
+            
+            # 2. 计算波高 (完全内联)
+            eta = 0.0
+            for w_idx in range(wave_k.shape[0]):
+                k = wave_k[w_idx]
+                w = wave_omega[w_idx]
+                for d_idx in range(wave_theta.shape[0]):
+                    th = wave_theta[d_idx]
+                    phase = k * (cur_x * math.cos(th) + cur_y * math.sin(th)) - w * current_time + wave_phi[w_idx, d_idx]
+                    eta += wave_amp[w_idx, d_idx] * math.cos(phase)
+            
+            # 3. 计算压力 (Z轴向下逻辑: cur_z > eta 为入水)
+            if cur_z > eta: # Z轴向下，数值大为深
+                depth = cur_z - eta
+                pressure = rho * g * depth * d_uuv * d_uuv
+                
+                # 法向量变换
+                fid = face_ids[i]
+                nx0, ny0, nz0 = face_normals[fid, 0], face_normals[fid, 1], face_normals[fid, 2]
+                
+                nx = r00*nx0 + r01*ny0 + r02*nz0
+                ny = r10*nx0 + r11*ny0 + r12*nz0
+                nz = r20*nx0 + r21*ny0 + r22*nz0
+                
+                # 累加力 (假设法向量向内)
+                fx = -pressure * nx
+                fy = -pressure * ny
+                fz = -pressure * nz
+                
+                # 累加力矩 (相对于重心)
+                # 重心在世界坐标的位置
+                gx = r00*g_center_local[0] + r01*g_center_local[1] + r02*g_center_local[2] + x
+                gy = r10*g_center_local[0] + r11*g_center_local[1] + r12*g_center_local[2] + y
+                gz = r20*g_center_local[0] + r21*g_center_local[1] + r22*g_center_local[2] + z
+                
+                rx = cur_x - gx
+                ry = cur_y - gy
+                rz = cur_z - gz
+                
+                s_reduce[tid, 0] += fx
+                s_reduce[tid, 1] += fy
+                s_reduce[tid, 2] += fz
+                s_reduce[tid, 3] += ry*fz - rz*fy
+                s_reduce[tid, 4] += rz*fx - rx*fz
+                s_reduce[tid, 5] += rx*fy - ry*fx
+
+        cuda.syncthreads()
+
+        # C. 块内归约 (Sum Reduction)
+        stride = TPB // 2
+        while stride > 0:
+            if tid < stride:
+                for k in range(6):
+                    s_reduce[tid, k] += s_reduce[tid + stride, k]
+            cuda.syncthreads()
+            stride //= 2
+            
+        # D. 物理积分 (由线程0单线程执行)
+        if tid == 0:
+            # 1. 获取总的 Froude-Krylov 力
+            fk_force_x = s_reduce[0, 0]
+            fk_force_y = s_reduce[0, 1]
+            fk_force_z = s_reduce[0, 2]
+            fk_mom_x   = s_reduce[0, 3]
+            fk_mom_y   = s_reduce[0, 4]
+            fk_mom_z   = s_reduce[0, 5]
+            
+            # 2. 转回 Body Frame (因为阻尼和质量矩阵通常在Body系定义)
+            # R_inv = R.T
+            # F_body = R.T * F_world
+            f_body_x = r00*fk_force_x + r10*fk_force_y + r20*fk_force_z
+            f_body_y = r01*fk_force_x + r11*fk_force_y + r21*fk_force_z
+            f_body_z = r02*fk_force_x + r12*fk_force_y + r22*fk_force_z
+            
+            m_body_x = r00*fk_mom_x + r10*fk_mom_y + r20*fk_mom_z
+            m_body_y = r01*fk_mom_x + r11*fk_mom_y + r21*fk_mom_z
+            m_body_z = r02*fk_mom_x + r12*fk_mom_y + r22*fk_mom_z
+            
+            # 3. 添加重力 (Body Frame)
+            # Z轴向下，重力在世界系是 [0, 0, W]
+            W = mass_matrix_inv[0,0] * 1.0 * g # 粗略获取质量，这里需要外部传入mass更好
+            # 严谨做法：应传入 m，为了简化假设 M_inv[0,0] = 1/m
+            m = 1.0 / mass_matrix_inv[0,0]
+            W = m * g
+            
+            # 重力转换到 Body 系: R.T * [0,0,W]
+            fg_body_x = r20 * W
+            fg_body_y = r21 * W
+            fg_body_z = r22 * W
+            
+            # 4. 添加阻尼 (Linear + Quadratic) & 控制力 & 恒定流
+            u, v, w = s_state[6], s_state[7], s_state[8]
+            p, q, r = s_state[9], s_state[10], s_state[11]
+            
+            # 总力 (Body Frame)
+            # F_total = F_FK + F_Gravity + F_Current + F_Control - Damping
+            # 注意：这里做极大简化，完整公式需矩阵运算
+            
+            # 示例：仅X轴方程
+            # Fx_total = f_body_x + fg_body_x + tau_control[0] + current_force[0] ...
+            #            - (damping_lin[0]*u + damping_quad[0]*abs(u)*u)
+            
+            forces = cuda.local.array(6, dtype=float32)
+            velocities = cuda.local.array(6, dtype=float32)
+            velocities[0]=u; velocities[1]=v; velocities[2]=w
+            velocities[3]=p; velocities[4]=q; velocities[5]=r
+            
+            # 组装力向量
+            forces[0] = f_body_x + fg_body_x + tau_control[0]
+            forces[1] = f_body_y + fg_body_y + tau_control[1]
+            forces[2] = f_body_z + fg_body_z + tau_control[2]
+            forces[3] = m_body_x + tau_control[3] # 忽略重力对重心力矩
+            forces[4] = m_body_y + tau_control[4]
+            forces[5] = m_body_z + tau_control[5]
+            
+            # 减去阻尼和科里奥利 (简化)
+            for k in range(6):
+                forces[k] -= (damping_lin[k] * velocities[k] + damping_quad[k] * abs(velocities[k]) * velocities[k])
+                
+            # 5. 求解加速度 (acc = M_inv * forces)
+            acc = cuda.local.array(6, dtype=float32)
+            for r_i in range(6):
+                acc_val = 0.0
+                for c_i in range(6):
+                    acc_val += mass_matrix_inv[r_i, c_i] * forces[c_i]
+                acc[r_i] = acc_val
+            
+            # 6. 积分 (Euler) -> 更新 s_state
+            # 更新速度
+            for k in range(6):
+                s_state[6+k] += acc[k] * dt
+                
+            # 更新位置 (需要 J(eta) 变换)
+            # d_pos = R * vel (简化版，忽略角速度的变换矩阵差异)
+            # 实际上 d_eta = J * nu
+            # 这里简单处理位置：
+            nu_u, nu_v, nu_w = s_state[6], s_state[7], s_state[8]
+            dx = r00*nu_u + r01*nu_v + r02*nu_w
+            dy = r10*nu_u + r11*nu_v + r12*nu_w
+            dz = r20*nu_u + r21*nu_v + r22*nu_w
+            
+            s_state[0] += dx * dt
+            s_state[1] += dy * dt
+            s_state[2] += dz * dt
+            
+            # 简单处理角度 (小角度假设，大角度需要四元数或完整J矩阵)
+            # d_euler = J2 * omega
+            nu_p, nu_q, nu_r = s_state[9], s_state[10], s_state[11]
+            # 简单映射，忽略万向节锁修正
+            s_state[3] += (nu_p + nu_q * math.sin(phi)*math.tan(theta) + nu_r * math.cos(phi)*math.tan(theta)) * dt
+            s_state[4] += (nu_q * math.cos(phi) - nu_r * math.sin(phi)) * dt
+            s_state[5] += (nu_q * math.sin(phi)/math.cos(theta) + nu_r * math.cos(phi)/math.cos(theta)) * dt
+
+            # 7. 写入轨迹输出 (Global Memory)
+            if step < total_steps:
+                out_trajectory[step, 0] = current_time
+                for k in range(12):
+                    out_trajectory[step, k+1] = s_state[k]
+
+        cuda.syncthreads() # 等待线程0完成更新，所有线程进入下一步
+
+@njit(parallel=True, fastmath=True)
+def compute_directions_numba(vertices, faces, g_center):
+    n_faces = len(faces)
+    # 预分配结果数组（避免append的动态扩容）
+    directions = np.empty((n_faces, 3), dtype=np.float64)
+    
+    # 并行循环遍历所有面（prange=并行range）
+    for i in prange(n_faces):
+        face = faces[i]
+        # 计算面中心（手动求和替代np.mean，减少NumPy调用开销）
+        v0 = vertices[face[0]]
+        v1 = vertices[face[1]]
+        v2 = vertices[face[2]]
+        face_center = (v0 + v1 + v2) / 3.0
+        
+        # 计算方向向量并归一化
+        dir_vec = g_center - face_center
+        norm = np.linalg.norm(dir_vec)
+        directions[i] = dir_vec / norm
+    
+    return directions
+@cuda.jit
+def wave_elevation_kernel(x, y, t, k, omega, wave_theta, amplitudes, phi_ij, 
+                        g, eta_out):
+    """
+    CUDA核函数：并行计算波高
+    每个线程计算一个点的波高
+    """
+    # 线程索引
+    point_idx = cuda.grid(1)
+    
+    if point_idx < x.shape[0]:
+        total_eta = 0.0
+        
+        # 获取该点的坐标
+        x_point = x[point_idx]
+        y_point = y[point_idx]
+        
+        # 遍历所有频率和方向
+        for i in range(k.shape[0]):
+            # 波数
+            k_i = k[i]
+            # 角频率
+            omega_i = omega[i]
+            
+            # 计算波速
+            c = math.sqrt(g / k_i)
+            
+            for j in range(wave_theta.shape[0]):
+                # 方向角
+                theta_j = wave_theta[j]
+                
+                # 计算相位
+                phase = (k_i * (x_point * math.cos(theta_j) + 
+                            y_point * math.sin(theta_j))
+                        - omega_i * t 
+                        + phi_ij[i, j])
+                
+                # 累加振幅贡献
+                total_eta += amplitudes[i, j] * math.cos(phase)
+        
+        # 存储结果
+        eta_out[point_idx] = total_eta
+
+class UnderwaterVehicle:
+    def __init__(self,m,
+                dt, t_max, T,
+                length, width, height, g, rho, A_wp, nabla, GM_L, GM_T,
+                xg, yg, zg, xb, yb, zb,
+                Ix, Iy, Iz,
+                X_u_dot, Y_v_dot, Z_w_dot, K_p_dot, M_q_dot, N_r_dot,
+                X_u, Y_v, Z_w, K_p, M_q, N_r,
+                X_u_absu, Y_v_absv, Z_w_absw, K_p_absp, M_q_absq, N_r_absr,
+                
+                d_uuv,Hs,T1,wave_N,wave_M,s,wave_type,main_theta,current_force_mag,current_angle,
+                omega_min, omega_max, x_range, y_range, dx, dy,global_x_range,global_y_range,global_dx,global_dy,
+                off_screen, cube_center, moviepath):
+        
+        self.length=length
+        self.width=width
+        self.height=height
+
+        self.m = m
+        self.u, self.v, self.w, self.p, self.q, self.r = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        self.x, self.y, self.z, self.phi, self.theta, self.psi = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        self.Tau_X, self.Tau_Y, self.Tau_Z, self.Tau_K, self.Tau_M, self.Tau_N = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        self.V = np.array([self.u, self.v, self.w, self.p, self.q, self.r])
+        self.Eta = np.array([self.x, self.y, self.z, self.phi, self.theta, self.psi])
+        self.Tau = np.array([self.Tau_X, self.Tau_Y, self.Tau_Z, self.Tau_K, self.Tau_M, self.Tau_N])
+        self.V_dot = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.Eta_dot = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # 重力和浮力
+        self.g = g
+        self.rho=rho
+        self.A_wp=A_wp
+        self.nabla=nabla
+        self.GM_L=GM_L
+        self.GM_T=GM_T
+
+        # 重心和浮心位置
+        self.xg, self.yg, self.zg = xg, yg, zg
+        self.xb, self.yb, self.zb = xb, yb, zb
+
+        # 时间步长和总时间
+        self.dt = dt
+        self.t_max = t_max
+        self.T = T
+        self.d_uuv=d_uuv
+
+        # 质量矩阵
+        self.Ix=Ix
+        self.Iy=Iy
+        self.Iz=Iz
+        self.M_RB = np.array([
+            [self.m, 0, 0, 0, 0, 0],
+            [0, self.m, 0, 0, 0, 0],
+            [0, 0, self.m, 0, 0, 0],
+            [0, 0, 0, self.Ix, 0, 0],
+            [0, 0, 0, 0, self.Iy, 0],
+            [0, 0, 0, 0, 0, self.Iz]
+        ])
+        self.X_u_dot=X_u_dot
+        self.Y_v_dot=Y_v_dot
+        self.Z_w_dot=Z_w_dot
+        self.K_p_dot=K_p_dot
+        self.M_q_dot=M_q_dot
+        self.N_r_dot=N_r_dot
+        self.M_A = np.array([
+            [self.X_u_dot, 0, 0, 0, 0, 0],
+            [0, self.Y_v_dot, 0, 0, 0, 0],
+            [0, 0, self.Z_w_dot, 0, 0, 0],
+            [0, 0, 0, self.K_p_dot, 0, 0],
+            [0, 0, 0, 0, self.M_q_dot, 0],
+            [0, 0, 0, 0, 0, self.N_r_dot]
+        ])
+        self.M = self.M_RB + self.M_A
+
+        # 科里奥利矩阵
+        self.X_u=X_u
+        self.Y_v=Y_v
+        self.Z_w=Z_w
+        self.K_p=K_p
+        self.M_q=M_q
+        self.N_r=N_r
+        self.X_u_absu=X_u_absu
+        self.Y_v_absv=Y_v_absv
+        self.Z_w_absw=Z_w_absw
+        self.K_p_absp=K_p_absp
+        self.M_q_absq=M_q_absq
+        self.N_r_absr=N_r_absr
+
+        # 轨迹记录
+        self.position_x = []
+        self.position_y = []
+        self.position_z = []
+        self.position_phi_rad = []
+        self.position_theta_rad = []
+        self.position_psi_rad = []
+        self.position_phi_degree = []
+        self.position_theta_degree = []
+        self.position_psi_degree = []
+
+
+        self.sim_time = t_max
+        self.fps = 1/dt
+        self.total_frames = self.fps * self.sim_time
+
+        # 参数设置
+        self.g = g       # 重力加速度 (m/s²)
+
+        # 生成波浪谱相关参数
+        self.Hs = Hs      # 有效波高 (m)
+        self.T1=T1
+
+
+        self.wave_N = wave_N        # 频率离散点数
+        self.wave_M = wave_M        # 方向离散点数
+        self.main_theta=main_theta
+        self.current_force_mag=current_force_mag
+        self.current_angle=current_angle
+        self.F_current_x = self.current_force_mag * np.cos(self.current_angle)
+        self.F_current_y = self.current_force_mag * np.sin(self.current_angle)
+
+        # 生成频率范围 (避免 ω=0)
+        self.omega_min = omega_min
+        self.omega_max = omega_max
+        # self.omega = np.linspace(self.omega_min, self.omega_max, self.wave_N)
+        # 生成对数间隔的频率数组
+        self.omega = np.logspace(
+            np.log10(self.omega_min), 
+            np.log10(self.omega_max), 
+            self.wave_N
+        )
+        # self.delta_omega =self.omega[1] - self.omega[0]
+        self.delta_omega = np.diff(self.omega)
+        self.delta_omega = np.append(self.delta_omega, self.delta_omega[-1])
+
+        self.k = np.array([self.wave_number(omega_i) for omega_i in self.omega])
+        self.s = s  # 方向集中度 (原2)
+
+        # 生成方向范围 (0~2π)
+        self.wave_theta = np.linspace(0, 2*pi, self.wave_M, endpoint=False)
+        self.delta_theta = self.wave_theta[1] - self.wave_theta[0]
+
+        self.phi_ij = np.random.uniform(0, 2*pi, (self.wave_N, self.wave_M))
+
+        # 预计算波数
+        self.k = self.omega**2 / self.g  # 波数 k = ω²/g (深水假设)
+
+        # 预计算振幅
+        self.wave_type=wave_type
+        self.amplitudes = np.zeros((self.wave_N, self.wave_M))
+        for i in range(self.wave_N):
+            for j in range(self.wave_M):
+                self.amplitudes[i, j] = sqrt(2 * self.S(self.omega[i],self.wave_type) * self.D(self.wave_theta[j]) * self.delta_omega[i] * self.delta_theta)
+        
+        # 方块参数
+        self.cube_length = self.length
+        self.cube_width = self.width
+        self.cube_height = self.height
+        self.cube_center = cube_center  # 初始中心位置
+        # 创建方块
+        self.initial_cube = pv.Cube(center=self.cube_center, 
+                            x_length=self.cube_length,
+                            y_length=self.cube_width,
+                            z_length=self.cube_height)
+        self.cube = pv.Cube(center=self.cube_center, 
+                            x_length=self.cube_length, 
+                            y_length=self.cube_width, 
+                            z_length=self.cube_height)
+        
+        # === 局部波浪参数 ===
+        self.x_range=x_range 
+        self.y_range=y_range
+        self.dx=dx
+        self.dy=dy
+        # 创建局部网格
+        self.plot_x = np.arange(self.x_range[0], self.x_range[1] + self.dx, self.dx)
+        self.plot_y = np.arange(self.y_range[0], self.y_range[1] + self.dy, self.dy)
+        self.plot_X, self.plot_Y = np.meshgrid(self.plot_x, self.plot_y)
+
+        # === 全局波浪参数 ===
+        self.global_x_range = global_x_range  # 更大的X范围
+        self.global_y_range = global_y_range  # 更大的Y范围
+        self.global_dx = global_dx  # 更大的网格间距
+        self.global_dy = global_dy
+        # 创建全局网格
+        self.global_plot_x = np.arange(self.global_x_range[0], self.global_x_range[1] + self.global_dx, self.global_dx)
+        self.global_plot_y = np.arange(self.global_y_range[0], self.global_y_range[1] + self.global_dy, self.global_dy)
+        self.global_plot_X, self.global_plot_Y = np.meshgrid(self.global_plot_x, self.global_plot_y)
+
+
+
+        self.wave_cache_dir = "wave_cache"
+        self.ensure_cache_dir_exists()
+
+        self.local_wave_heights_cache = {}
+        self.global_wave_heights_cache = {}
+        
+        # 定义六个面的顶点索引
+        self.faces = [
+            [0, 1, 2, 3],  # x-
+            [0, 1, 7, 4],  # y-
+            [0, 3, 5, 4],  # z-
+            [4, 5, 6, 7],  # x+
+            [2, 3, 5, 6],  # y+
+            [1, 2, 6, 7]   # z+
+        ]
+        self.face_np=np.ascontiguousarray(self.faces, dtype=np.int64)
+
+        self.unit_vertices = self.cube.points
+        all_points=[]
+        face_ids=[]
+        for i, face in enumerate(self.faces):
+            # 计算面的基向量
+            v1 = self.unit_vertices[face[1]] - self.unit_vertices[face[0]]
+            v2 = self.unit_vertices[face[3]] - self.unit_vertices[face[0]]
+            v1_len = np.linalg.norm(v1)
+            v2_len = np.linalg.norm(v2)
+            
+            # 计算采样点数量
+            num_u = int(v1_len / self.d_uuv)
+            num_v = int(v2_len / self.d_uuv)
+            
+            # 生成采样点坐标
+            u_coords = np.linspace(0.5, v1_len - 0.5, num_u) / v1_len
+            v_coords = np.linspace(0.5, v2_len - 0.5, num_v) / v2_len
+            
+            for u in u_coords:
+                for v in v_coords:
+                    point = self.unit_vertices[face[0]] + u*v1 + v*v2
+                    all_points.append(point)
+                    face_ids.append(i)
+        # 转换为数组
+        self.all_points_init = np.array(all_points)
+        self.face_ids_init = np.array(face_ids)
+        
+        # 1. 预处理初始几何 (相对于局部原点)
+        # 确保 all_points_init 的中心是 (0,0,0)，或者你知道它相对于重心的位置
+        self.d_points_init = cuda.to_device(self.all_points_init.astype(np.float32))
+        self.d_face_ids = cuda.to_device(self.face_ids_init.astype(np.int32))
+
+        # 计算初始面法向量 (只做一次)
+        # 假设 self.face_normals 是 (6, 3) 数组
+        normals = np.array([
+            [-1, 0, 0], [0, -1, 0], [0, 0, -1],
+            [1, 0, 0],  [0, 1, 0],  [0, 0, 1]
+        ], dtype=np.float32) # 简化示例，根据你的faces顺序对应
+        self.d_normals = cuda.to_device(normals)
+
+        # 2. 预处理波浪参数
+        self.d_wave_k = cuda.to_device(self.k.astype(np.float32))
+        self.d_wave_omega = cuda.to_device(self.omega.astype(np.float32))
+        self.d_wave_theta = cuda.to_device(self.wave_theta.astype(np.float32))
+        self.d_wave_amp = cuda.to_device(self.amplitudes.astype(np.float32))
+        self.d_wave_phi = cuda.to_device(self.phi_ij.astype(np.float32))
+
+        # 3. 预分配输出显存
+        self.d_force = cuda.device_array(3, dtype=np.float32)
+        self.d_moment = cuda.device_array(3, dtype=np.float32)
+
+        # 计算 Grid 大小
+        self.threads_per_block = 256
+        self.blocks_per_grid = (self.all_points_init.shape[0] + 255) // 256
+
+        # self.wave_data_file2 = self.get_wave_data_filename(self.global_x_range, self.global_y_range,self.global_dx,self.global_dy)
+        # # 尝试从缓存加载波浪数据
+        # if self.load_wave_data_from_cache(self.wave_data_file2,self.global_x_range, self.global_y_range,self.global_dx,self.global_dy,self.global_wave_heights_cache):
+        #     print("已从缓存加载波浪数据")
+        # else:
+        #     print("未找到匹配的波浪数据缓存，正在计算...")
+        #     time.sleep(3)
+        #     self.wave_init(self.global_plot_X, self.global_plot_Y,self.global_wave_heights_cache)
+        #     self.save_wave_data_to_cache(self.wave_data_file2,self.global_x_range, self.global_y_range,self.global_dx,self.global_dy,self.global_wave_heights_cache)
+
+        # self.wave_data_file1 = self.get_wave_data_filename(self.x_range, self.y_range,self.dx,self.dy)
+        # # 尝试从缓存加载波浪数据
+        # if self.load_wave_data_from_cache(self.wave_data_file1,self.x_range, self.y_range,self.dx,self.dy,self.local_wave_heights_cache):
+        #     print("已从缓存加载波浪数据")
+        # else:
+        #     print("未找到匹配的波浪数据缓存，正在计算...")
+        #     self.wave_init(self.plot_X, self.plot_Y,self.local_wave_heights_cache)
+        #     self.save_wave_data_to_cache(self.wave_data_file1,self.x_range, self.y_range,self.dx,self.dy,self.local_wave_heights_cache)
+
+        # 创建分屏plotter (1行2列)
+        # self.plotter = pv.Plotter(shape=(1, 2), off_screen=off_screen)
+        # self.plotter.enable_depth_peeling()  # 提高深度精度
+
+        # # === 左侧子图 ===
+        # self.plotter.subplot(0, 0)
+        # self.plot_Z = self.local_wave_heights_cache[(0)]  # 这里 t 可以指定
+        # self.points = np.column_stack((self.plot_X.ravel(), self.plot_Y.ravel(), self.plot_Z.ravel()))
+        # self.point_cloud = pv.PolyData(self.points)
+        # local_min = min(np.min(w[:,2]) for w in self.local_wave_heights_cache.values())
+        # local_max = max(np.max(w[:,2]) for w in self.local_wave_heights_cache.values())
+
+        # self.actor = self.plotter.add_mesh(
+        #     self.point_cloud, 
+        #     scalars=self.points[:, 2],         # 用z值着色
+        #     cmap='viridis_r',               # 选择色带（如'viridis', 'jet', 'coolwarm'等）
+        #     point_size=5,
+        #     render_points_as_spheres=True,
+        #     clim=(local_min, local_max)  # 固定颜色范围
+        # )
+        # self.plotter.add_axes(line_width=3, labels_off=False)
+
+
+        # self.plotter.subplot(0, 1)
+        # self.global_plot_Z = self.global_wave_heights_cache[(0)]
+        # self.global_points = np.column_stack((self.global_plot_X.ravel(), self.global_plot_Y.ravel(), self.global_plot_Z.ravel()))
+        # self.global_point_cloud = pv.PolyData(self.global_points)
+        # global_min = min(np.min(w) for w in self.global_wave_heights_cache.values())
+        # global_max = max(np.max(w) for w in self.global_wave_heights_cache.values())
+
+        # self.actor = self.plotter.add_mesh(
+        #     self.global_point_cloud, 
+        #     scalars=self.global_points[:, 2],
+        #     cmap='viridis_r',
+        #     point_size=5,  # 点更小以提高性能
+        #     render_points_as_spheres=True,
+        #     clim=(global_min, global_max)  # 固定颜色范围
+        # )
+        # self.plotter.add_axes(line_width=3, labels_off=False)
+
+        
+        
+        
+        # self.plotter.subplot(0, 0)
+        # self.cube_actor = self.plotter.add_mesh(self.cube, color='blue', opacity=0.7)
+
+        # self.plotter.subplot(0, 1)
+        # self.global_cube_actor = self.plotter.add_mesh(self.cube, color='red', opacity=1)
+        # self.global_cube_actor = self.plotter.add_mesh(
+        #     self.cube, 
+        #     color='crimson',  # 亮红色比普通red更鲜艳
+        #     opacity=0.8,      # 降低透明度，增强存在感
+        #     smooth_shading=True  # 平滑着色增加立体感
+        # )
+        # self.global_cube_wire = self.plotter.add_mesh(
+        #     self.cube,
+        #     color='black',    # 黑色边框与红色主体形成强对比
+        #     style='wireframe',
+        #     line_width=5,     # 加粗边框
+        #     render_lines_as_tubes=True  # 线条渲染为管状，更醒目
+        # )
+
+        # self.moviepath=moviepath
+        # self.plotter.open_movie(moviepath)
+
+        
+
+        self.max_workers = multiprocessing.cpu_count()
+
+    def get_world_sample_points(self, vertices):
+        """根据当前顶点位置计算世界坐标系中的采样点"""
+        # 计算变换矩阵：局部到世界
+        # 重心作为参考点
+        g_center = np.mean(vertices, axis=0)
+        
+        # 构建变换矩阵（平移+旋转）
+        # 这里简化处理：使用顶点0,1,3构建局部坐标系
+        v0 = vertices[0]
+        v1 = vertices[1]
+        v3 = vertices[3]
+        
+        # 局部坐标轴
+        local_x = (v1 - v0) / np.linalg.norm(v1 - v0)
+        temp = (v3 - v0) / np.linalg.norm(v3 - v0)
+        local_z = np.cross(local_x, temp)
+        local_z /= np.linalg.norm(local_z)
+        local_y = np.cross(local_z, local_x)
+        
+        # 旋转矩阵
+        R = np.column_stack([local_x, local_y, local_z])
+        
+        # 应用变换：world_points = R @ local_points.T + g_center
+        world_points = (R @ self._local_sample_points.T).T + g_center
+        
+        return world_points, self._local_face_ids
+    
+    def update_J(self):
+        """更新运动学矩阵 J_eta"""
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(self.phi), np.sin(self.phi)],
+            [0, -np.sin(self.phi), np.cos(self.phi)]
+        ])
+        Ry = np.array([
+            [np.cos(self.theta), 0, -np.sin(self.theta)],
+            [0, 1, 0],
+            [np.sin(self.theta), 0, np.cos(self.theta)]
+        ])
+        Rz = np.array([
+            [np.cos(self.psi), -np.sin(self.psi), 0],
+            [np.sin(self.psi), np.cos(self.psi), 0],
+            [0, 0, 1]
+        ])
+        # J1_eta1 = Rx @ Ry @ Rz
+        J1_eta1 = Rz @ Ry @ Rx
+        self.rotation_matrix=J1_eta1
+        sf=np.sin(self.phi)
+        sx=np.sin(self.theta)
+        sp=np.sin(self.psi)
+        cf=np.cos(self.phi)
+        cx=np.cos(self.theta)
+        cp=np.cos(self.psi)
+
+        J1_eta2= np.array([
+            [cx*cp,-cf*sp+sf*sx*cp,sf*sp+cf*sx*cp],
+            [cx*sp,-cf*cp+sf*sx*sp,-sf*cp+cf*sx*sp],
+            [-sx,cx*sp,cf*sx]
+        ])
+        if np.abs(np.abs(self.theta) - np.pi / 2) < 1e-6 or np.abs(np.abs(self.theta) + np.pi / 2) < 1e-6:
+            J2_eta2 = np.eye(3)
+        else:
+            J2_eta2 = np.array([
+                [1, np.sin(self.phi) * np.tan(self.theta), np.cos(self.phi) * np.tan(self.theta)],
+                [0, np.cos(self.phi), -np.sin(self.phi)],
+                [0, np.sin(self.phi) / np.cos(self.theta), np.cos(self.phi) / np.cos(self.theta)]
+            ])
+        # self.J_eta = np.block([
+        #     [J1_eta1, np.zeros((3, 3))],
+        #     [np.zeros((3, 3)), J2_eta2]
+        # ])
+        self.J_eta = np.block([
+            [J1_eta1, np.zeros((3, 3))],
+            [np.zeros((3, 3)), J2_eta2]
+        ])
+
+    def update_CV(self):
+        """更新科里奥利矩阵 C_V"""
+        a1, a2, a3, b1, b2, b3 = self.X_u_dot * self.u, self.Y_v_dot * self.v, self.Z_w_dot * self.w, self.K_p_dot * self.p, self.M_q_dot * self.q, self.N_r_dot * self.r
+        CA_V = np.array([
+            [0, 0, 0, 0, -a3, a2],
+            [0, 0, 0, a3, 0, -a1],
+            [0, 0, 0, -a2, a1, 0],
+            [0, -a3, a2, 0, -b3, b2],
+            [a3, 0, -a1, b3, 0, -b1],
+            [-a2, a1, 0, -b2, b1, 0]
+        ])
+        CRB_V = np.array([
+            [0, 0, 0, 0, self.m * self.w, self.m * self.v],
+            [0, 0, 0, -self.m * self.w, 0, self.m * self.u],
+            [0, 0, 0, self.m * self.v, -self.m * self.u, 0],
+            [0, self.m * self.w, -self.m * self.v, 0, self.Iz * self.r, self.Iy * self.q],
+            [-self.m * self.w, 0, self.m * self.u, -self.Iz * self.r, 0, self.Ix * self.p],
+            [-self.m * self.v, -self.m * self.u, 0, -self.Iy * self.q, -self.Ix * self.p, 0]
+        ])
+        self.C_V = CA_V + CRB_V
+
+    
+    def update_DV(self):
+        """更新阻尼矩阵 D_V"""
+        self.D_V = np.array([
+            [self.X_u + self.X_u_absu * np.abs(self.u), 0, 0, 0, 0, 0],
+            [0, self.Y_v + self.Y_v_absv * np.abs(self.v), 0, 0, 0, 0],
+            [0, 0, self.Z_w + self.Z_w_absw * np.abs(self.w), 0, 0, 0],
+            [0, 0, 0, self.K_p + self.K_p_absp * np.abs(self.p), 0, 0],
+            [0, 0, 0, 0, self.M_q + self.M_q_absq * np.abs(self.q), 0],
+            [0, 0, 0, 0, 0, self.N_r + self.N_r_absr * np.abs(self.r)]
+        ])
+
+
+
+    
+    # def update_gEta(self, t):
+    #     total_force_global = np.zeros(3)  # 全局坐标系中的总力
+    #     total_moment_global = np.zeros(3)  # 全局坐标系中的总力矩（关于重心）
+
+
+    #     # 获取此时此刻cube的顶点坐标   世界坐标系，z朝上
+    #     vertices=self.cube.points
+    #     face1=[vertices[0],vertices[1],vertices[2],vertices[3]]  # x-
+    #     face2=[vertices[0],vertices[1],vertices[7],vertices[4]]  # y-
+    #     face3=[vertices[0],vertices[3],vertices[5],vertices[4]]  # z-
+    #     face4=[vertices[4],vertices[5],vertices[6],vertices[7]]  # x+
+    #     face5=[vertices[2],vertices[3],vertices[5],vertices[6]]  # y+
+    #     face6=[vertices[1],vertices[2],vertices[6],vertices[7]]  # z+
+
+    #     faces=[face1,face2,face3,face4,face5,face6]
+
+    #     g_center=(vertices[0]+vertices[1]+vertices[2]+vertices[3]+vertices[4]+vertices[5]+vertices[6]+vertices[7])/8
+
+    #     # 压力方向是由面指向中心
+    #     # 原点①（0，0，0）   指向点②（0，1，0），向量为（0，1，0）   即 ② - ①
+    #     # ①面指向②中心   即 ② - ① 中心 - 面
+    #     directions=[]
+    #     for i in range(6):
+    #         direction=g_center-(faces[i][0]+faces[i][1]+faces[i][2]+faces[i][3])/4
+    #         direction=direction/np.linalg.norm(np.array(direction))
+    #         directions.append(direction)
+
+    #     # 创建线程安全的结果容器
+    #     force_lock = Lock()
+    #     moment_lock = Lock()
+
+    #     # 定义处理单个面的函数
+    #     def process_face(i):
+    #         local_force = np.zeros(3)
+    #         local_moment = np.zeros(3)
+
+    #         du=(faces[i][1]-faces[i][0])/np.linalg.norm(np.array(faces[i][1]-faces[i][0]))*self.d_uuv
+    #         dv=(faces[i][3]-faces[i][0])/np.linalg.norm(np.array(faces[i][1]-faces[i][0]))*self.d_uuv
+
+    #         for dx in range(int(np.linalg.norm(np.array(faces[i][1]-faces[i][0]))/self.d_uuv)):
+    #             for dy in range(int(np.linalg.norm(np.array(faces[i][3]-faces[i][0]))/self.d_uuv)):
+                    
+    #                 d_point=faces[i][0]+du*(dx+0.5) + dv*(dy+0.5)
+
+    #                 wave_height=self.wave_elevation_point(d_point[0],d_point[1],t)
+
+    #                 if wave_height<d_point[2]:
+    #                     pressure=self.rho*self.g*(d_point[2]-wave_height)*self.d_uuv**2
+    #                     pressure_vector=-pressure*directions[i]
+
+    #                     # 计算相对于重心的力矩
+    #                     r = d_point - g_center
+    #                     moment = np.cross(r, pressure_vector)
+
+    #                     local_force += pressure_vector
+    #                     local_moment += moment
+    #         return local_force, local_moment
+    #     # 使用线程池处理各个面
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+    #         results = list(executor.map(process_face, range(6)))
+    #     # 合并所有线程的结果
+    #     for force, moment in results:
+    #         total_force_global += force
+    #         total_moment_global += moment
+    def update_gEta(self, t):
+        # 1. 准备当前帧的变换矩阵
+        # 旋转矩阵 (Python算好传进去，量很小)
+        rotation = R.from_euler('xyz', [self.phi, self.theta, self.psi], degrees=False)
+        rot_matrix = rotation.as_matrix().astype(np.float32)
+        # 平移向量
+        trans_vec = np.array([self.x, self.y, self.z], dtype=np.float32)
+
+        total_force_global = np.zeros(3)
+        total_moment_global = np.zeros(3)
+        
+        # 获取方块顶点和重心
+        vertices = self.cube.points
+        g_center = np.mean(vertices, axis=0)
+
+        # 2. 清零 GPU 结果数组
+        self.d_force.copy_to_device(np.zeros(3, dtype=np.float32))
+        self.d_moment.copy_to_device(np.zeros(3, dtype=np.float32))
+    
+        # 3. 启动加速核函数
+        fast_fsi_kernel[self.blocks_per_grid, self.threads_per_block](
+            self.d_points_init, self.d_face_ids, self.d_normals, # 几何
+            cuda.to_device(rot_matrix), cuda.to_device(trans_vec), cuda.to_device(g_center), # 运动
+            self.d_wave_k, self.d_wave_omega, self.d_wave_theta, self.d_wave_amp, self.d_wave_phi, # 波浪
+            float32(t), # 时间
+            float32(self.rho), float32(self.g), float32(self.d_uuv), # 物理常数
+            self.d_force, self.d_moment # 输出
+        )
+        total_force_global = self.d_force.copy_to_host()
+        total_moment_global = self.d_moment.copy_to_host()
+        
+        R_inv = rot_matrix.T  # 旋转矩阵的转置 = 逆矩阵（全局到物体）
+        total_force_body = R_inv @ total_force_global
+        total_moment_body = R_inv @ total_moment_global
+        
+        # === 添加重力 ===
+        W = self.m * self.g
+        
+        # 重力在物体坐标系中的分量
+        F_gravity_body = np.array([
+            W * np.sin(self.theta),
+            -W * np.sin(self.phi) * np.cos(self.theta),
+            -W * np.cos(self.phi) * np.cos(self.theta),
+            -self.yg*W*np.cos(self.phi)*np.cos(self.theta)+self.zg*W*np.sin(self.phi)*np.cos(self.theta),
+            self.zg*W*np.sin(self.theta)+self.xg*W*np.cos(self.phi)*np.cos(self.theta),
+            -self.xg*W*np.cos(self.phi)*np.cos(self.theta)-self.yg*W*np.sin(self.theta)
+        ])
+
+        g_eta = np.zeros(6)
+        g_eta[0:3] = total_force_body
+        
+        # 恢复力矩 = 浮力矩(物体坐标系)
+        g_eta[3:6] = total_moment_body
+
+        g_eta= g_eta + F_gravity_body
+
+        # 数值稳定性检查
+        if np.any(np.isnan(g_eta)) or np.any(np.abs(g_eta) > 1e10):
+            print(f"警告：恢复力过大 {g_eta}，重置为0")
+            g_eta = np.zeros(6)
+        
+        self.g_Eta = g_eta
+    # def update_gEta(self, t):
+    #     total_force_global = np.zeros(3)  # 全局坐标系中的总力
+    #     total_moment_global = np.zeros(3)  # 全局坐标系中的总力矩（关于重心）
+
+
+    #     # 获取此时此刻cube的顶点坐标   世界坐标系，z朝上
+    #     vertices=self.cube.points
+    #     face1=[vertices[0],vertices[1],vertices[2],vertices[3]]  # x-
+    #     face2=[vertices[0],vertices[1],vertices[7],vertices[4]]  # y-
+    #     face3=[vertices[0],vertices[3],vertices[5],vertices[4]]  # z-
+    #     face4=[vertices[4],vertices[5],vertices[6],vertices[7]]  # x+
+    #     face5=[vertices[2],vertices[3],vertices[5],vertices[6]]  # y+
+    #     face6=[vertices[1],vertices[2],vertices[6],vertices[7]]  # z+
+
+    #     faces=[face1,face2,face3,face4,face5,face6]
+
+    #     g_center=(vertices[0]+vertices[1]+vertices[2]+vertices[3]+vertices[4]+vertices[5]+vertices[6]+vertices[7])/8
+
+    #     # 压力方向是由面指向中心
+    #     # 原点①（0，0，0）   指向点②（0，1，0），向量为（0，1，0）   即 ② - ①
+    #     # ①面指向②中心   即 ② - ① 中心 - 面
+    #     directions=[]
+    #     for i in range(6):
+    #         direction=g_center-(faces[i][0]+faces[i][1]+faces[i][2]+faces[i][3])/4
+    #         direction=direction/np.linalg.norm(np.array(direction))
+    #         directions.append(direction)
+
+    #     # 现在每个面都有方向
+    #     # 对每个面取面元，求面元上的压力
+    #     for i in range(6):
+    #         du=(faces[i][1]-faces[i][0])/np.linalg.norm(np.array(faces[i][1]-faces[i][0]))*self.d_uuv
+    #         dv=(faces[i][3]-faces[i][0])/np.linalg.norm(np.array(faces[i][1]-faces[i][0]))*self.d_uuv
+
+    #         for dx in range(int(np.linalg.norm(np.array(faces[i][1]-faces[i][0]))/self.d_uuv)):
+    #             for dy in range(int(np.linalg.norm(np.array(faces[i][3]-faces[i][0]))/self.d_uuv)):
+                    
+    #                 d_point=faces[i][0]+du*(dx+0.5) + dv*(dy+0.5)
+
+    #                 wave_height=self.wave_elevation_point(d_point[0],d_point[1],t)
+
+    #                 if wave_height<d_point[2]:
+    #                     pressure=self.rho*self.g*(d_point[2]-wave_height)*self.d_uuv**2
+    #                     pressure_vector=-pressure*directions[i]
+
+    #                     # 计算相对于重心的力矩
+    #                     r = d_point - g_center
+    #                     moment = np.cross(r, pressure_vector)
+
+    #                     total_force_global += pressure_vector
+    #                     total_moment_global += moment
+    #     # === 坐标系转换：全局 -> 物体 ===
+    #     # 计算旋转矩阵（局部到全局）
+    #     rotation = R.from_euler('xyz', [self.phi, self.theta, self.psi], degrees=False)
+    #     rot_matrix = rotation.as_matrix()  # 获取旋转矩阵
+    #     R_inv = rot_matrix.T  # 旋转矩阵的转置 = 逆矩阵（全局到物体）
+    #     total_force_body = R_inv @ total_force_global
+    #     total_moment_body = R_inv @ total_moment_global
+        
+    #     # === 添加重力 ===
+    #     W = self.m * self.g
+        
+    #     # 重力在物体坐标系中的分量
+    #     F_gravity_body = np.array([
+    #         W * np.sin(self.theta),
+    #         -W * np.sin(self.phi) * np.cos(self.theta),
+    #         -W * np.cos(self.phi) * np.cos(self.theta),
+    #         -self.yg*W*np.cos(self.phi)*np.cos(self.theta)+self.zg*W*np.sin(self.phi)*np.cos(self.theta),
+    #         self.zg*W*np.sin(self.theta)+self.xg*W*np.cos(self.phi)*np.cos(self.theta),
+    #         -self.xg*W*np.cos(self.phi)*np.cos(self.theta)-self.yg*W*np.sin(self.theta)
+    #     ])
+
+    #     g_eta = np.zeros(6)
+    #     g_eta[0:3] = total_force_body
+        
+    #     # 恢复力矩 = 浮力矩(物体坐标系)
+    #     g_eta[3:6] = total_moment_body
+
+    #     g_eta= g_eta + F_gravity_body
+
+    #     # 数值稳定性检查
+    #     if np.any(np.isnan(g_eta)) or np.any(np.abs(g_eta) > 1e10):
+    #         print(f"警告：恢复力过大 {g_eta}，重置为0")
+    #         g_eta = np.zeros(6)
+        
+    #     self.g_Eta = g_eta
+
+
+   
+
+    def update_V_u(self):
+        """更新速度 u"""
+        self.u = self.V[0]
+        self.v = self.V[1]
+        self.w = self.V[2]
+        self.p = self.V[3]
+        self.q = self.V[4]
+        self.r = self.V[5]
+    
+    def update_Eta_x(self):
+        """更新位置 x"""
+        self.x = self.Eta[0]
+        self.y = self.Eta[1]
+        self.z = self.Eta[2]
+        self.phi = self.Eta[3]
+        self.theta = self.Eta[4]
+        self.psi = self.Eta[5]
+
+    def update_Tau_X(self):
+        """更新控制力 X"""
+        self.Tau_X = self.Tau[0]
+        self.Tau_Y = self.Tau[1]
+        self.Tau_Z = self.Tau[2]
+        self.Tau_K = self.Tau[3]
+        self.Tau_M = self.Tau[4]
+        self.Tau_N = self.Tau[5]
+
+
+    def update_params(self,t):
+        """更新所有参数"""
+        self.update_V_u()
+        self.update_Eta_x()
+        self.update_Tau_X()
+        self.update_J()
+        self.update_CV()
+        self.update_DV()
+        self.update_gEta(t)
+        
+        
+
+    def simulate(self,tau_x0,tau_n0):
+        """运行模拟"""
+        # total_time = round(self.total_frames / self.fps, 2)  # 计算总时间并保留两位小数
+    
+        # with tqdm(total=total_time, desc="Simulation Progress", unit="s") as pbar:
+        #     start_time=time.time()
+        print("仿真时间：",self.sim_time)
+        M_inv = np.linalg.inv(self.M)
+        for frame in tqdm(range(int(self.total_frames)),dynamic_ncols=True,mininterval=0.5):
+            t = frame / self.fps  # 当前时间
+            self.update_params(t)
+
+
+            psi=self.psi
+            # --- 限制 Theta 防止奇点 ---
+            if self.theta > 1.4: self.theta = 1.4
+            if self.theta < -1.4: self.theta = -1.4
+            # -------------------------
+
+            c = np.cos(psi)
+            s = np.sin(psi)
+            self.f_current_body_u =  self.F_current_x * c + self.F_current_y * s
+            self.f_current_body_v = -self.F_current_x * s + self.F_current_y * c
+            self.Tau_X = tau_x0 + self.f_current_body_u
+            self.Tau_Y = 0 + self.f_current_body_v
+            self.Tau_Z = 0
+            self.Tau_K=0
+            self.Tau_M=0
+            self.Tau_N=tau_n0
+            self.Tau = np.array([self.Tau_X, self.Tau_Y, self.Tau_Z, self.Tau_K,self.Tau_M,self.Tau_N])
+            #self.Tau = np.linalg.inv(self.J_eta) @ self.Tau
+
+            self.V_dot = M_inv @ (self.Tau - self.C_V @ self.V - self.D_V @ self.V - self.g_Eta)
+
+            if np.linalg.norm(self.V_dot) > 500: # 异常大的加速度
+                self.V_dot = self.V_dot / np.linalg.norm(self.V_dot) * 500
+
+            self.V += self.V_dot * self.dt
+
+            self.Eta_dot = self.J_eta @ self.V
+            self.Eta += self.Eta_dot * self.dt
+
+            self.position_x.append(self.Eta[0])
+            self.position_y.append(self.Eta[1])
+            self.position_z.append(self.Eta[2])
+            self.position_phi_rad.append(self.Eta[3])
+            self.position_theta_rad.append(self.Eta[4])
+            self.position_psi_rad.append(self.Eta[5])
+            self.position_phi_degree.append(self.Eta[3]/2/pi*360)
+            self.position_theta_degree.append(self.Eta[4]/2/pi*360)
+            self.position_psi_degree.append(self.Eta[5]/2/pi*360)
+
+            # 更新方块位置 (两个可视化使用相同的方块位置)
+            rotation = R.from_euler('xyz', [self.phi, self.theta, self.psi])
+            rot_matrix = rotation.as_matrix()
+            points = self.initial_cube.points - self.initial_cube.center
+            rotated_points = (rot_matrix @ points.T).T
+            cube_center = np.array([self.x, self.y, self.z])
+            translated_points = rotated_points + cube_center
+            
+            # 更新方块
+            self.cube.points = translated_points
+
+    def visualize(self):
+        print("开始可视化：")
+        for frame in tqdm(range(int(self.total_frames))):
+            t = frame / self.fps  # 当前时间
+            self.plotter.subplot(0, 0)
+            local_wave_heights=self.local_wave_heights_cache[(t)]
+            self.points[:, 2] = local_wave_heights.ravel()
+            self.point_cloud.points = self.points  # 更新点云数据
+            self.plotter.update_scalars(
+                scalars=self.points[:, 2], 
+                mesh=self.point_cloud, 
+                render=False
+            )
+
+            # === 更新全局波浪可视化 ===
+            self.plotter.subplot(0, 1)
+            global_wave_heights=self.global_wave_heights_cache[(t)]
+            self.global_points[:, 2] = global_wave_heights.ravel()
+            self.global_point_cloud.points = self.global_points
+            self.plotter.update_scalars(
+                scalars=self.global_points[:, 2], 
+                mesh=self.global_point_cloud, 
+                render=False
+            )
+            phi=self.position_phi_rad[frame]
+            theta=self.position_theta_rad[frame]
+            psi=self.position_psi_rad[frame]
+            x=self.position_x[frame]
+            y=self.position_y[frame]
+            z=self.position_z[frame]
+
+            # 更新方块位置 (两个可视化使用相同的方块位置)
+            rotation = R.from_euler('xyz', [phi, theta, psi])
+            rot_matrix = rotation.as_matrix()
+            points = self.initial_cube.points - self.initial_cube.center
+            rotated_points = (rot_matrix @ points.T).T
+            cube_center = np.array([x, y, z])
+            translated_points = rotated_points + cube_center
+            
+            # 更新方块
+            self.cube.points = translated_points
+            self.plotter.subplot(0, 0)
+            self.plotter.update_coordinates(self.cube.points, render=False)  # 更新方块坐标
+            self.plotter.subplot(0, 1)
+            self.plotter.update_coordinates(self.cube.points, render=False)
+
+            self.plotter.render()            # 渲染新帧
+            self.plotter.write_frame()       # 写入帧
+
+            if frame == 2:
+                self.plotter.subplot(0, 0)
+                # 获取当前相机位置和关注点
+                camera_position = self.plotter.camera.position
+                camera_focus = self.plotter.camera.focal_point
+                # 将相机的z坐标取负
+                new_camera_position = (camera_position[1], camera_position[0], -camera_position[2])
+                # 更新相机位置，保持关注点不变
+                self.plotter.camera.position = new_camera_position
+                self.plotter.camera.focal_point = camera_focus
+                self.plotter.camera.up = (0, 0, -1)  # 设置z轴向下
+
+                self.plotter.subplot(0, 1)
+                camera_position = self.plotter.camera.position
+                camera_focus = self.plotter.camera.focal_point
+                new_camera_position = (camera_position[1], camera_position[0], -camera_position[2])
+                self.plotter.camera.position = new_camera_position
+                self.plotter.camera.focal_point = camera_focus
+                self.plotter.camera.up = (0, 0, -1)  # 设置z轴向下
+
+
+        # 关闭两个plotter
+        self.plotter.close()
+
+        print(f"局部动画生成完成: {self.moviepath}")
+
+
+
+
+        # 左右拼接两个视频
+
+
+    # def plot_trajectory(self):
+    #     """绘制三维轨迹"""
+    #     fig = plt.figure()
+    #     ax = fig.add_subplot(111, projection='3d')
+    #     ax.plot(self.position_x, self.position_y, self.position_z, label='Trajectory')
+    #     ax.set_xlabel('X')
+    #     ax.set_ylabel('Y')
+    #     ax.set_zlabel('Z')
+    #     ax.set_title('3D Trajectory Plot')
+    #     ax.legend()
+    #     plt.show()
+    #     # 保存图片至本地
+    #     fig.savefig('./sim.png')
+    def plot_trajectory(self,filename):
+        """绘制多个参数随时间变化的曲线和三维轨迹"""
+        # 创建一个包含7个子图的图形
+        fig = plt.figure(figsize=(18, 10))
+        
+        # 设置子图布局：左侧3个子图，中间3个子图，右侧1个3D子图
+        # 左侧：x、y、z随时间变化
+        time= np.arange(0, self.sim_time, self.dt)
+        ax1 = fig.add_subplot(331)
+        ax1.plot(time, self.position_x)
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('X')
+        ax1.set_title('X vs Time')
+        
+        ax2 = fig.add_subplot(334)
+        ax2.plot(time, self.position_y)
+        ax2.set_xlabel('Time')
+        ax2.set_ylabel('Y')
+        ax2.set_title('Y vs Time')
+        
+        ax3 = fig.add_subplot(337)
+        ax3.plot(time, self.position_z)
+        ax3.set_xlabel('Time')
+        ax3.set_ylabel('Z')
+        ax3.set_title('Z vs Time')
+        
+        # 中间：phi、theta、psi随时间变化
+        ax4 = fig.add_subplot(332)
+        ax4.plot(time, self.position_phi_degree)  # 转换为角度
+        ax4.set_xlabel('Time')
+        ax4.set_ylabel('Phi')
+        ax4.set_title('Phi vs Time')
+        
+        ax5 = fig.add_subplot(335)
+        ax5.plot(time, self.position_theta_degree)  # 转换为角度
+        ax5.set_xlabel('Time')
+        ax5.set_ylabel('Theta')
+        ax5.set_title('Theta vs Time')
+        
+        ax6 = fig.add_subplot(338)
+        ax6.plot(time, self.position_psi_degree)  # 转换为角度
+        ax6.set_xlabel('Time')
+        ax6.set_ylabel('Psi')
+        ax6.set_title('Psi vs Time')
+        
+        # 右侧：3D轨迹
+        ax7 = fig.add_subplot(133, projection='3d')
+        ax7.plot(self.position_x, self.position_y, self.position_z, label='Trajectory')
+        ax7.set_xlabel('X')
+        ax7.set_ylabel('Y')
+        ax7.set_zlabel('Z')
+        ax7.set_title('3D Trajectory Plot')
+        ax7.legend()
+        
+        # 自动调整布局
+        plt.tight_layout()
+
+        fig.savefig(filename, dpi=300, bbox_inches='tight') 
+        
+        # # 显示图形
+        # plt.show()
+
+           
+
+    def write_data_to_file(self, filename):
+        """将xyz数据写入文件"""
+        try:
+            with open(filename, 'w') as file:
+                line = f"date,x(m),y(m),z(m),phi(°),theta(°),psi(°)\n"
+                file.write(line)
+                t=0
+                for x, y, z,phi,theta,psi,  in zip(self.position_x, self.position_y, self.position_z,self.position_phi_rad,self.position_theta_rad,self.position_psi_rad):
+                    t+=self.dt
+                    line = f"{t:.3f},{x:.5f},{y:.5f},{z:.5f},{phi:.5f},{theta:.5f},{psi:.5f}\n"
+                    file.write(line)
+            print(f"数据已成功写入文件 {filename}")
+        except Exception as e:
+            print(f"写入文件时出现错误: {e}")
+
+    # def read_and_plot_from_file(self, filename):
+    #     """从文件中读取数据并绘制三维轨迹"""
+    #     try:
+    #         position_x = []
+    #         position_y = []
+    #         position_z = []
+    #         with open(filename, 'r') as file:
+    #             for line in file:
+    #                 x, y, z = map(float, line.strip().split())
+    #                 position_x.append(x)
+    #                 position_y.append(y)
+    #                 position_z.append(z)
+
+    #         fig = plt.figure()
+    #         ax = fig.add_subplot(111, projection='3d')
+    #         ax.plot(position_x, position_y, position_z, label='Trajectory from file')
+    #         ax.set_xlabel('X')
+    #         ax.set_ylabel('Y')
+    #         ax.set_zlabel('Z')
+    #         ax.set_title('3D Trajectory Plot from File')
+    #         ax.legend()
+    #         plt.show()
+    #     except Exception as e:
+    #         print(f"读取文件时出现错误: {e}")
+
+    # 定义方向分布函数 D(θ) (余弦型)
+    def D(self, theta_val):
+        # 步骤1：计算角度差，并归一化到 [-π, π] 区间（核心解决周期性）
+        delta_theta = theta_val - self.main_theta
+        # 使用 np.mod 实现周期归一：先转成 [0, 2π)，再转 [-π, π)
+        delta_theta = np.mod(delta_theta + pi, 2 * pi) - pi
+        
+        # 步骤2：判断归一化后的角度差是否在 [-π/2, π/2] 范围内
+        if -pi/2 <= delta_theta <= pi/2:
+            return (2/pi) * np.cos(delta_theta)**2
+        else:
+            return 0  # 超出范围的方向返回0
+        #return (2/pi) * np.cos(theta_val)**2  # 主浪向为θ=0
+
+    # 定义频率谱 S(ω) (Pierson-Moskowitz)
+    # def S(self,omega_val):
+    #     B = 3.11 / self.Hs**2
+    #     A = 8.1*10**(-3)*self.g**2
+    #     return (A / omega_val**5) * np.exp(-B / omega_val**4)
+
+    def S(self,omega,wave_type):
+        # 'JONSWAP'  'pierson-Moskowitz'
+        if wave_type=='JONSWAP':
+            T1=self.T1
+            gamma=3.3
+            if(omega<=5.24/T1):
+                sigma=0.07
+            else:
+                sigma=0.09
+            Y=np.exp(-((0.191*omega*T1-1)/(2**0.5*sigma))**2)
+            S= 155*self.Hs**2/T1**4*omega**(-5)*np.exp(-944/T1**4*omega**(-4))*gamma**Y
+            return S
+        if wave_type=='pierson-Moskowitz':
+            B = 3.11 / self.Hs**2
+            A = 8.1*10**(-3)*self.g**2
+            return (A / omega**5) * np.exp(-B / omega**4)
+        # 不然，退出程序
+        print("生成波浪谱类型出错，检查'JONSWAP' or 'pierson-Moskowitz'!")
+        exit()
+    
+    def wave_number(self, omega, depth=10.0):
+        """计算色散关系 k(ω)"""
+        k = omega**2 / self.g  # 初始近似
+        for _ in range(5):  # 迭代求解
+            k = omega**2 / (self.g * np.tanh(k * depth))
+        return k
+    
+    def ensure_cache_dir_exists(self):
+        """确保缓存目录存在"""
+        if not os.path.exists(self.wave_cache_dir):
+            os.makedirs(self.wave_cache_dir)
+    def get_wave_data_filename(self,x_range,y_range,dx,dy):
+        """根据波浪参数生成唯一的文件名"""
+        # 提取关键波浪参数作为哈希
+        wave_params = {
+            "sim_time": self.sim_time,
+            "fps": self.fps,
+            "g":self.g,
+            "Hs": self.Hs,
+            "T1": self.T1,
+            "wave_N": self.wave_N,
+            "wave_M": self.wave_M,
+            "omega_min": self.omega_min,
+            "omega_max": self.omega_max,
+            "omega":self.omega,
+            "s":self.s,
+            "wave_theta":self.wave_theta,
+            "phi_ij":self.phi_ij,
+            "wave_type":self.wave_type,
+            "x_range": x_range,
+            "y_range": y_range,
+            "dx": dx,
+            "dy": dy 
+        }
+        
+        # 生成参数的哈希值作为文件名的一部分
+        param_hash = hashlib.md5(str(wave_params).encode('utf-8')).hexdigest()[:8]
+        return os.path.join(self.wave_cache_dir, f"wave_data_{param_hash}.npz")
+    def load_wave_data_from_cache(self,file,x_range,y_range,dx,dy,cache):
+        """从缓存加载波浪数据"""
+        if os.path.exists(file):
+            try:
+                with np.load(file, allow_pickle=True) as data:
+                    # 检查参数是否匹配
+                    saved_params = data['params'].item()
+                    current_params = {
+                        "sim_time": self.sim_time,
+                        "fps": self.fps,
+                        "g":self.g,
+                        "Hs": self.Hs,
+                        "T1": self.T1,
+                        "wave_N": self.wave_N,
+                        "wave_M": self.wave_M,
+                        "omega_min": self.omega_min,
+                        "omega_max": self.omega_max,
+                        "omega":self.omega,
+                        "s":self.s,
+                        "wave_theta":self.wave_theta,
+                        "phi_ij":self.phi_ij,
+                        "wave_type":self.wave_type,
+                        "x_range": x_range,
+                        "y_range": y_range,
+                        "dx": dx,
+                        "dy": dy 
+                    }
+                    
+                    params_match = True
+                    for k in current_params:
+                        v1 = saved_params[k]
+                        v2 = current_params[k]
+                        if isinstance(v1, np.ndarray) or isinstance(v2, np.ndarray):
+                            # 对于数组，使用allclose或array_equal
+                            if not np.allclose(v1, v2):
+                                params_match = False
+                                break
+                        else:
+                            if v1 != v2:
+                                params_match = False
+                                break
+                    
+                    # 加载波浪高度数据
+                    self.wave_heights_cache = {}
+                    total_frames = int(self.sim_time * self.fps)
+                    for frame in range(total_frames):
+                        t = frame / self.fps
+                        key = f'{t}'
+                        if key in data:
+                            cache[(t)] = data[key]
+                    return True
+            except Exception as e:
+                print(f"加载波浪数据缓存失败: {e}")
+                return False
+        return False
+    def save_wave_data_to_cache(self,file,x_range,y_range,dx,dy,cache):
+        """将波浪数据保存到缓存"""
+        try:
+            # 准备要保存的参数
+            params = {
+                "sim_time": self.sim_time,
+                "fps": self.fps,
+                "g":self.g,
+                "Hs": self.Hs,
+                "T1": self.T1,
+                "wave_N": self.wave_N,
+                "wave_M": self.wave_M,
+                "omega_min": self.omega_min,
+                "omega_max": self.omega_max,
+                "omega":self.omega,
+                "s":self.s,
+                "wave_theta":self.wave_theta,
+                "phi_ij":self.phi_ij,
+                "wave_type":self.wave_type,
+                "x_range": x_range,
+                "y_range": y_range,
+                "dx": dx,
+                "dy": dy 
+            }
+            # 准备要保存的数据
+            save_data = {'params': params}
+            total_frames = int(self.sim_time * self.fps)
+            
+            # 将波浪高度数据添加到保存字典中
+            for frame in range(total_frames):
+                t = frame / self.fps
+                save_data[f'{t}'] = cache[(t)]
+            
+            # 保存到NPZ文件
+            np.savez_compressed(file, **save_data)
+            print(f"波浪数据已保存到 {file}")
+        except Exception as e:
+            print(f"保存波浪数据缓存失败: {e}")
+    def compute_wave_heights_for_frame(self, plot_X, plot_Y, t):
+        """计算单个时间步的局部和全局波浪高度"""
+        if t%5==0:
+            print(f"计算时间步 t={t:.2f} 的波浪高度...")
+        wave_heights = self.wave_elevation_vectorized(plot_X, plot_Y, t=t)
+        return wave_heights
+    
+    def wave_init(self,plot_x,plot_y,cache):
+        """预先计算整个仿真时间内的波浪高度"""
+        print("预计算波浪高度...")
+        total_frames = int(self.sim_time * self.fps)
+        # 获取 CPU 核心数
+        num_processes = multiprocessing.cpu_count()
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_processes) as executor:
+            partial_compute_wave_heights = partial(self.compute_wave_heights_for_frame,plot_x, plot_y)
+            # 生成时间步列表
+            times = [frame / self.fps for frame in range(total_frames)]
+            # 并行计算每个时间步的波浪高度
+            results = list(executor.map(partial_compute_wave_heights, times))
+
+        # 将结果存储到缓存中
+        for t, wave_heights in zip(times, results):
+            cache[(t)] = wave_heights
+
+        print("波浪高度预计算完成。")
+
+    def wave_elevation_vectorized(self, X, Y, t):
+        phases = np.zeros((*X.shape, self.wave_N, self.wave_M))
+        for i, omega_i in enumerate(self.omega):
+            c = np.sqrt(self.g / self.k[i])  # 波速
+            for j, theta_j in enumerate(self.wave_theta):
+                # 增加传播项：c * t * cos/sin(theta)
+                # propagation_x = c * t * np.cos(theta_j)
+                # propagation_y = c * t * np.sin(theta_j)
+                
+                phases[..., i, j] = (
+                    self.k[i] * (X * np.cos(theta_j) + 
+                                Y * np.sin(theta_j))
+                    - omega_i * t 
+                    + self.phi_ij[i, j]
+                )
+        return np.sum(self.amplitudes * np.cos(phases), axis=(-1, -2))
+    # def wave_elevation_point(self,X, Y, t):
+    #     eta=0
+    #     for i in range(self.wave_N):
+    #         for j in range(self.wave_M):
+    #             # 计算相位：k[i] * (X*cos(theta[j]) + Y*sin(theta[j])) - omega[i]*t + phi_ij[i,j]
+    #             phase = self.k[i] * (X * cos(self.wave_theta[j]) + Y * sin(self.wave_theta[j])) - self.omega[i] * t + self.phi_ij[i, j]
+    #             # 叠加波分量
+    #             eta += self.amplitudes[i, j] * cos(phase)
+    #     return eta
+
+    def wave_elevation_point(self, X, Y, t):
+        eta = 0
+        for i in range(self.wave_N):
+            c = np.sqrt(self.g / self.k[i])  # 波速
+            for j in range(self.wave_M):
+                # 增加传播项：c * t * cos/sin(theta)
+                # propagation_x = c * t * cos(self.wave_theta[j])
+                # propagation_y = c * t * sin(self.wave_theta[j])
+
+                # 计算相位：k[i] * ((X - propagation_x) * cos(theta[j]) + (Y - propagation_y) * sin(theta[j])) - omega[i]*t + phi_ij[i,j]
+                phase = self.k[i] * (X * cos(self.wave_theta[j]) + Y * sin(self.wave_theta[j])) - self.omega[i] * t + self.phi_ij[i, j]
+                # 叠加波分量
+                eta += self.amplitudes[i, j] * cos(phase)
+        return eta
+    # def wave_elevation_points(self, points, t):
+    #     """一次性计算多个点的波高"""
+    #     x = points[:, 0]
+    #     y = points[:, 1]
+    #     eta = np.zeros(len(points))
+        
+    #     # 预计算常数
+    #     k = self.k
+    #     omega = self.omega
+    #     wave_theta = self.wave_theta
+    #     amplitudes = self.amplitudes
+    #     phi_ij = self.phi_ij
+    #     g = self.g
+        
+    #     for i in range(len(omega)):
+    #         c = np.sqrt(g / k[i])  # 波速
+    #         for j in range(len(wave_theta)):
+    #             # 传播项
+    #             # propagation_x = c * t * np.cos(wave_theta[j])
+    #             # propagation_y = c * t * np.sin(wave_theta[j])
+                
+    #             # 向量化计算相位
+    #             phase = (
+    #                 k[i] * (x  * np.cos(wave_theta[j]) + 
+    #                         y  * np.sin(wave_theta[j]))
+    #                 - omega[i] * t 
+    #                 + phi_ij[i, j]
+    #             )
+    #             eta += amplitudes[i, j] * np.cos(phase)
+        
+    #     return eta
+    
+
+    
+    def wave_elevation_points(self, points, t):
+        """GPU加速的波高计算"""
+        # 提取坐标
+        x = points[:, 0].astype(np.float32)
+        y = points[:, 1].astype(np.float32)
+        
+        # 波浪参数（转换为float32）
+        k = np.array(self.k, dtype=np.float32)
+        omega = np.array(self.omega, dtype=np.float32)
+        wave_theta = np.array(self.wave_theta, dtype=np.float32)
+        amplitudes = np.array(self.amplitudes, dtype=np.float32)
+        phi_ij = np.array(self.phi_ij, dtype=np.float32)
+        g = np.float32(self.g)
+        
+        # 点数
+        n_points = len(points)
+        
+        # 分配GPU内存
+        x_gpu = cuda.to_device(x)
+        y_gpu = cuda.to_device(y)
+        k_gpu = cuda.to_device(k)
+        omega_gpu = cuda.to_device(omega)
+        wave_theta_gpu = cuda.to_device(wave_theta)
+        amplitudes_gpu = cuda.to_device(amplitudes)
+        phi_ij_gpu = cuda.to_device(phi_ij)
+        
+        # 结果数组
+        eta_gpu = cuda.device_array(n_points, dtype=np.float32)
+        
+        # 配置CUDA线程
+        threads_per_block = 256
+        blocks_per_grid = (n_points + threads_per_block - 1) // threads_per_block
+        
+        # 启动核函数
+        wave_elevation_kernel[blocks_per_grid, threads_per_block](
+            x_gpu, y_gpu, t, k_gpu, omega_gpu, wave_theta_gpu, 
+            amplitudes_gpu, phi_ij_gpu, g, eta_gpu
+        )
+        
+        # # 同步并获取结果
+        # cuda.synchronize()
+        # eta = eta_gpu.copy_to_host()
+        
+        return eta_gpu
+
+
+
+# 按照文献中，质量为177kg，重心位置为（0,0,0.1），浮心位置为（0,0,-0.05），重力加速度为9.8m/s^2
+# 以螺旋桨分布内缩0.1为边界，长宽高分别为0.4m, 0.3m, 0.3m
+# length=0.4m, width=0.3m, height=0.3m
+# 重力加速度为9.8m/s^2，重力为1734.6N
+# 当重力=浮力时，AUV在水中的体积为（rho*g*V_pai=mg -> V_pai=mg/g/rho） V_pai=177*9.8/1000/9.8=1.76m^3
+# 当重力-浮力平衡时，没入水中的深度为h=(V_pai/width/length)=(1.76/0.3/0.4)=14.67cm=0.1467m
+# 令AUV在水中漂浮平衡时为初始状态。此时水上部分高度为0.3-0.1467=0.1533m，水下部分高度为0.1467m
+
+# m = 120.0
+# length, width, height = 0.4, 0.3, 0.3
+# dt, t_max, T = 0.0333, 300, 10
+# g, rho, A_wp, nabla = 9.8, 1000, length * width, 0.1467
+# GM_L, GM_T = 0.05, 0.05
+# xg, yg, zg = 0.0, 0.0, 0.1
+# xb, yb, zb = 0.0, 0.0, -0.05
+# Ix, Iy, Iz = 10.7, 11.8, 13.4
+# X_u_dot, Y_v_dot, Z_w_dot, K_p_dot, M_q_dot, N_r_dot = 58.4, 23.8, 23.8, 3.38, 1.18, 2.67
+# X_u, Y_v, Z_w, K_p, M_q, N_r = 120, 90, 150, 50, 15, 18
+# X_u_absu, Y_v_absv, Z_w_absw, K_p_absp, M_q_absq, N_r_absr = 90, 90, 120, 10, 12, 15
+
+
+
+# 不按照文献，以浮木为例。浮木密度500kg/m3
+# 质量为100斤，50kg。求得体积为0.1m3
+# 长宽高4:3:3,分别为0.56, 0.42, 0.42
+# 重心位置为（0,0,0.2），浮心位置为（0,0,0），重力加速度为9.8m/s^2
+# 重力加速度为9.8m/s^2，重力为490
+# 当重力=浮力时，浮木在水中的体积为（rho*g*V_pai=mg -> V_pai=mg/g/rho） V_pai=50/1000=0.05 m3
+# 当重力-浮力平衡时，没入水中的深度为h=(V_pai/width/length)=(0.05/0.56/0.42)=0.2126m
+# 令浮木在水中漂浮平衡时为初始状态。此时水上部分高度为0.42-0.2126=0.2074m，水下部分高度为0.2126m
+
+m = 30
+# length, width, height = 0.56, 0.42, 0.42
+length, width, height = 0.5, 0.4, 0.4
+d_uuv=0.01
+
+# m = 500
+# # length, width, height = 0.56, 0.42, 0.42
+# length, width, height = 3, 2, 2
+# d_uuv=0.25
+
+fps=120
+dt, t_max, T = 1/fps,360, 10
+g, rho, A_wp  = 9.8, 1000, length * width
+nabla=  m / rho  # 排水体积 m³
+GM_L, GM_T = 0.05, 0.05
+xg, yg, zg = 0.0, 0.0, 0.2
+xb, yb, zb = 0.0, 0.0, 0
+# Ix, Iy, Iz = 10.7, 11.8, 13.4
+# 长方体惯性矩计算（质量均匀分布）
+Ix = (1/12) * m * (width**2 + height**2)
+Iy = (1/12) * m * (length**2 + height**2)
+Iz = (1/12) * m * (length**2 + width**2)
+X_u_dot, Y_v_dot, Z_w_dot, K_p_dot, M_q_dot, N_r_dot = 58.4, 23.8, 23.8, 3.38, 1.18, 2.67
+X_u, Y_v, Z_w, K_p, M_q, N_r = 120, 90, 150, 50, 15, 18
+X_u_absu, Y_v_absv, Z_w_absw, K_p_absp, M_q_absq, N_r_absr = 90, 90, 120, 10, 12, 15
+
+wave_N = 30        # 频率离散点数
+wave_M = 20        # 方向离散点数
+s= 5 # 方向集中度   0-10
+wave_type='JONSWAP'
+# 'JONSWAP'  'pierson-Moskowitz'
+
+# 生成频率范围 (避免 ω=0)
+omega_min = 0.1
+omega_max = 3.0
+
+range_max=5
+dd=0.1
+x_range=[-range_max,range_max]
+y_range=[-range_max,range_max]
+dx=dd
+dy=dd
+
+global_x_range = [-range_max*10, range_max*10]  # 更大的X范围
+global_y_range = [-range_max*10, range_max*10]  # 更大的Y范围
+global_dx = dd*10  # 更大的网格间距
+global_dy = dd*10
+
+off_screen=True
+
+cube_center = [0, 0, 0]  # 初始中心位置
+
+# 打开动画文件
+moviepath='./point_cloud_animation.mp4'
+
+pi = np.pi
+data_setting_group = []
+for _ in range(9999):
+    # 1. 生成Hs：0.1~5，集中0.8~3（截断正态分布）
+    while True:
+        Hs = np.random.normal(loc=1.9, scale=3)  # 均值1.9，标准差0.7
+        if 0.1 <= Hs <= 5:
+            break
+    if np.random.rand() < 0.3:
+        # 模式A：风浪（Wind Sea），周期短，波陡大
+        # T1 ≈ 3.0 * sqrt(Hs)，范围 [2.5, 3.5]
+        T1 = np.random.uniform(2.5, 3.5) * np.sqrt(Hs)
+    else:
+        # 模式B：涌浪（Swell），周期长，波陡小
+        # T1 ≈ 6.0 * sqrt(Hs)，范围 [4.0, 8.0]
+        # 哪怕浪高只有1米，周期也可能达到6-8秒
+        T1 = np.random.uniform(4.0, 8.0) * np.sqrt(Hs)
+    # # 2. 生成T1：随Hs调整（经验关系+扰动）
+    # T1_base = 2.5 * np.sqrt(Hs)  # 波高-周期经验公式
+    # T1 = T1_base + np.random.uniform(-0.3, 0.3)  # 小扰动
+    # T1 = max(0.1, T1)  # 保证T1≥0.1
+    
+    # 3. 生成tau_x0：0~50，集中0~10（Beta分布偏态采样）
+    # Beta分布(α=1, β=5)偏向左，转换到0~50
+    tau_x0_raw = np.random.beta(a=1, b=5)
+    tau_x0 = tau_x0_raw * 50  # 映射到0~50
+    tau_x0 = round(tau_x0, 1)  # 保留1位小数
+    
+    # 4. 生成tau_n0：-5~5，集中-1~1，且tau_x0越小tau_n0范围越窄
+    if tau_x0 <= 10:
+        # tau_x0小（0~10），tau_n0限制在-1~1
+        tau_n0 = np.random.uniform(-0.5, 0.5)
+    elif tau_x0 <= 30:
+        # tau_x0中等（10~30），tau_n0限制在-3~3
+        tau_n0 = np.random.uniform(-2, 2)
+    else:
+        # tau_x0大（30~50），tau_n0放宽到-5~5
+        tau_n0 = np.random.uniform(-3, 3)
+    tau_n0 = round(tau_n0, 1)  # 保留1位小数
+    
+    # 5. 生成main_theta：-π ~ π 均匀分布
+    main_theta = np.random.uniform(-pi, pi)
+    main_theta = round(main_theta, 2)  # 保留2位小数
+
+    # 模拟风/流：大小随机，方向随机
+    current_force_mag = np.random.uniform(0, 5.0) # 0~5牛顿的力（相对于30kg物体不算大）
+    current_angle = np.random.uniform(-pi, pi)
+    
+    # 整理参数（Hs/T1保留1位小数，保证可读性）
+    is_set0=np.random.uniform(0, 100)
+    if is_set0<65:
+        tau_x0=0
+        tau_n0=0
+    param = {
+        'Hs': round(Hs, 1),
+        'T1': round(T1, 1),
+        'tau_x0': tau_x0,
+        'tau_n0': tau_n0,
+        'main_theta': main_theta,
+        'current_force_mag':current_force_mag,
+        'current_angle':current_angle
+    }
+    data_setting_group.append(param)
+
+
+# # 生成波浪谱相关参数
+# Hs = 1.5      # 有效波高 (m)
+# T1=5      # 主周期 (s)
+# main_theta=0
+
+SKIPPED_GROUP_NUM=5000
+idx=0
+index_name="./dataset-cp/index.csv"
+for group in data_setting_group:
+    idx+=1
+    if idx<=SKIPPED_GROUP_NUM:
+        continue
+    Hs=group['Hs']
+    T1=group['T1']
+    tau_x0=group['tau_x0']
+    tau_n0=group['tau_n0']
+    main_theta=group['main_theta']
+    current_force_mag=group['current_force_mag']
+    current_angle=group['current_angle']
+    save_name="floater_trace_"+str(idx)+"_"+str(fps)
+    csv_name="./dataset-cp/"+save_name+".csv"
+    jpg_name="./dataset-cp/"+save_name+".jpg"
+    vehicle = UnderwaterVehicle(m,
+                                dt, t_max, T,
+                                length, width, height, g, rho, A_wp, nabla, GM_L, GM_T,
+                                xg, yg, zg, xb, yb, zb,
+                                Ix, Iy, Iz,
+                                X_u_dot, Y_v_dot, Z_w_dot, K_p_dot, M_q_dot, N_r_dot,
+                                X_u, Y_v, Z_w, K_p, M_q, N_r,
+                                X_u_absu, Y_v_absv, Z_w_absw, K_p_absp, M_q_absq, N_r_absr,
+                                
+                                d_uuv,Hs,T1,wave_N,wave_M,s,wave_type,main_theta,current_force_mag,current_angle,
+                                omega_min, omega_max, x_range, y_range, dx, dy,global_x_range, global_y_range, global_dx, global_dy,
+                                off_screen, cube_center, moviepath)
+
+    # try:
+    vehicle.simulate(tau_x0=tau_x0,tau_n0=tau_n0)
+    try:
+        with open(index_name, 'a') as file:
+            if idx==1:
+                line = f"idx,Hs,T1,tau_x0,tau_n0,main_theta,current_force_mag,current_angle\n"
+                file.write(line)
+            line = f"{idx},{Hs},{T1},{tau_x0},{tau_n0},{main_theta},{current_force_mag},{current_angle}\n"
+            file.write(line)
+    except Exception as e:
+        print(f"写入文件时出现错误: {e}")
+    vehicle.write_data_to_file(csv_name)
+    # vehicle.visualize()
+    vehicle.plot_trajectory(jpg_name)
+# finally:
+#     vehicle.plotter.close()
+
+
