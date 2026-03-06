@@ -1,5 +1,6 @@
 import math
 # import plotly.graph_objects as go
+import cv2
 import numpy as np
 # from plotly.subplots import make_subplots
 from math import pi, cos, sin, sqrt
@@ -27,7 +28,19 @@ np.random.seed(42)  # 固定随机种子确保结果可重现
 from numba import cuda, float32
 
 
-TARGET_FPS = 30  
+# 强制 VTK 使用 EGL 进行硬件加速的离线渲染
+os.environ['VTK_DEFAULT_RENDER_WINDOW'] = 'vtkEGLRenderWindow'
+# # 如果有多张显卡，可以指定显卡 ID（比如 0 或 1）
+# os.environ['VTK_EGL_DEVICE_INDEX'] = '0'
+
+# pv.global_theme.allow_empty_mesh = True
+pv.global_theme.smooth_shading = True # 开启后 GPU 会自动做片元插值，弥补网格精度
+
+
+
+TARGET_FPS = 10
+render_width = 1280
+render_height = 720
 
 TPB = 256 
 @cuda.jit
@@ -534,7 +547,7 @@ class UnderwaterVehicle:
                 X_u_absu, Y_v_absv, Z_w_absw, K_p_absp, M_q_absq, N_r_absr,
                 
                 d_uuv,Hs,T1,wave_N,wave_M,s,wave_type,main_theta,current_force_mag,current_angle,water_depth,
-                omega_min, omega_max, x_range, y_range, dx, dy,global_x_range,global_y_range,global_dx,global_dy,
+                omega_min, omega_max,
                 off_screen, cube_center, moviepath):
         
         self.length=length
@@ -1356,7 +1369,7 @@ class UnderwaterVehicle:
             
             
             wave_heights = eta_gpu.copy_to_host()
-            cache[i] = wave_heights.reshape(plot_X.shape) # 使用索引 i 存储
+            cache[(t)] = wave_heights.reshape(plot_X.shape) # 使用索引 i 存储
 
         # print("GPU 波浪预计算完成。")
 
@@ -1465,6 +1478,8 @@ class UnderwaterVehicle:
                            x_length=self.cube_length, 
                            y_length=self.cube_width, 
                            z_length=self.cube_height)
+        
+        uuv_base_points = uuv_mesh.points.copy()
         # try:
         #     uuv_mesh = pv.read(MESH_FILE)
         # except:
@@ -1473,7 +1488,7 @@ class UnderwaterVehicle:
         # 2. 创建波浪网格
         # ================= [关键优化2] 降低网格密度 =================
         buffer = 20.0 
-        g_dx, g_dy = 1.5, 1.5  # [修改] 0.5 -> 1.5 (网格点数减少约9倍，大幅提升速度)
+        g_dx, g_dy = 2, 2  # [修改] 0.5 -> 1.5 (网格点数减少约9倍，大幅提升速度)
         
         min_x, max_x = min(uuv_trace['x'].values)-buffer, max(uuv_trace['x'].values)+buffer
         min_y, max_y = min(uuv_trace['y'].values)-buffer, max(uuv_trace['y'].values)+buffer
@@ -1487,7 +1502,7 @@ class UnderwaterVehicle:
         self.wave_init(global_plot_X, global_plot_Y,t_vals, global_wave_heights_cache)
 
         # 4. 初始化 Plotter
-        plotter = pv.Plotter(shape=(1, 2), off_screen=self.off_screen, window_size=[1600, 900])
+        plotter = pv.Plotter(shape=(1, 2), off_screen=self.off_screen, window_size=[render_width, render_height])
         plotter.set_background("lightblue")
         plotter.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
 
@@ -1585,15 +1600,41 @@ class UnderwaterVehicle:
         C = L / wp_T1
 
 
+
+
+
+
+
+        # ==================== [核心修改] OpenCV 视频写入初始化 ====================
+        sidebar_width = 300  # 侧边栏宽度
+        total_width = render_width + sidebar_width
+        total_height = render_height
+        
+        # mp4v 是比较通用的编码
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+        out_video = cv2.VideoWriter(self.moviepath, fourcc, actual_fps, (total_width, total_height))
+
+        # 辅助函数：在图片上写多行文字
+        def put_multiline_text(img, text, pos, font, scale, color, thickness, line_height):
+            x, y = pos
+            for line in text.split('\n'):
+                cv2.putText(img, line, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+                y += line_height
+
+
+
         # 渲染循环
         # [优化] 使用 enumerate 直接获取索引，避免浮点数计算误差
+        # for frame_idx in tqdm(range(len(uuv_trace)), unit="frame", desc="Rendering Video"):
         for frame_idx in tqdm(range(len(uuv_trace)), unit="frame", desc="Rendering Video"):
             x, y, z = x_vals[frame_idx], y_vals[frame_idx], z_vals[frame_idx]
             phi, theta, psi = phi_vals[frame_idx], theta_vals[frame_idx], psi_vals[frame_idx]
             
             # 更新波浪
-            if frame_idx in global_wave_heights_cache:
-                z_values = global_wave_heights_cache[frame_idx]
+            # t = frame_idx / self.fps
+            t = np.float32(t_vals[frame_idx])
+            if t in global_wave_heights_cache:
+                z_values = global_wave_heights_cache[t]
                 water_mesh.points[:, 2] = z_values.ravel()
                 water_mesh.point_data["Elevation"] = z_values.ravel()
                 
@@ -1605,19 +1646,22 @@ class UnderwaterVehicle:
             # 更新位置
             rotation = R.from_euler('zyx', [psi, theta, phi])
             rot_matrix = rotation.as_matrix()
-            transform_mat = np.eye(4)
-            transform_mat[:3, :3] = rot_matrix
-            transform_mat[:3, 3] = [x, y, z] 
 
-            body_actor.user_matrix = transform_mat
-            global_body_actor.user_matrix = transform_mat
+            # 计算新坐标: New_Points = (Base_Points @ Rot_Matrix.T) + Translation
+            # uuv_base_points: (N, 3)
+            # rot_matrix.T:    (3, 3)
+            rotated_points = uuv_base_points @ rot_matrix.T
+            translated_points = rotated_points + np.array([x, y, z])
+
+            # [核心修改] 直接将计算好的新坐标赋值给网格
+            # 这会立即更新所有引用该网格的 Actor
+            uuv_mesh.points = translated_points
 
             ship_pos = np.array([x,y,z])
             plotter.subplot(0, 0)
             ideal_cam_pos = ship_pos + relative_offset
             diff_vec = ideal_cam_pos - current_cam_pos
             distance = np.linalg.norm(diff_vec)
-
             if distance > deadzone_radius:
                 move_vec = diff_vec * smooth_factor
                 current_cam_pos += move_vec
@@ -1639,81 +1683,155 @@ class UnderwaterVehicle:
                 plotter.camera.up = (0, 0, -1)
                 plotter.reset_camera_clipping_range()
 
-            # 1. 计算当前时刻船所在位置的实时波高 (Relative Wave Elevation)
+
+
+            # # 1. 计算当前时刻船所在位置的实时波高 (Relative Wave Elevation)
+            # curr_t = t_vals[frame_idx]
+            # uuv_wave_h = uuv_wave_heights_array[frame_idx]
+            
+            # vx=vx_vals[frame_idx]
+            # vy=vy_vals[frame_idx]
+            # vz=vz_vals[frame_idx]
+            # u=u_vals[frame_idx]
+            # v=v_vals[frame_idx]
+            # w=w_vals[frame_idx]
+            # p=p_vals[frame_idx]*57.3
+            # q=q_vals[frame_idx]*57.3
+            # r=r_vals[frame_idx]*57.3
+            
+            # hud_text = (
+            #     f"Local View (Follow)\n"
+            #     f"TIME : {curr_t:06.2f} s\n"
+            #     f"---------------------\n"
+            #     f"World_Pos     : N {x:6.1f} | E {y:6.1f} | D {z:6.1f} m\n"
+            #     f"World_Speed   : N {vx:6.1f} | E {vy:6.1f} | D {vz:6.1f} m\n"
+            #     f"\n"
+            #     f"Wave_Pos      : N {x:6.1f} | E {y:6.1f} | D {uuv_wave_h:6.1f} m\n"
+            #     f"Self_Pos      : N {x:6.1f} | E {y:6.1f} | D {z:6.1f} m\n"
+            #     f"\n"
+            #     f"Self_Deg      : R {np.degrees(phi):6.1f} | P {np.degrees(theta):6.1f} | Y {np.degrees(psi):6.1f} deg\n"
+            #     f"\n"
+            #     f"Self_Speed    : u {u:6.1f} | v {v:6.1f} | w {w:6.1f} m/s\n"
+            #     f"Self_Speed_Deg: p {p:6.1f} | q {q:6.1f} | r {r:6.1f} deg/s\n"
+            #     f"---------------------\n"
+            # )
+            
+            # # # 3. 添加到左侧视图 (subplot 0)
+            # # plotter.subplot(0, 0)
+            # # plotter.add_text(
+            # #     hud_text, 
+            # #     position='upper_left', 
+            # #     font_size=12,       # 字体大小
+            # #     color='white',      # 字体颜色
+            # #     font='courier',     # 使用等宽字体，数字不跳动
+            # #     name='hud_status',  # [关键] 设置固定名字，实现更新而非覆盖
+            # #     shadow=True         # 添加阴影，在浅色背景下也能看清
+            # # )
+            
+            # # # (可选) 在右侧全局视图显示简略信息
+            # # plotter.subplot(0, 1)
+            # # global_msg = (
+            # #     f"Global View\n"
+            # #     f"---------------------\n"
+            # #     f"Wave_Params:\n"
+            # #     f"  Hs              :{wp_Hs:6.1f} m\n"
+            # #     f"  T1              :{wp_T1:6.1f} s\n"
+            # #     f"  main_theta      :{wp_theta:6.1f} deg\n"
+            # #     f"  wave_type       :{str(wp_type)}\n"
+            # #     f"  water depth     :{str(self.water_depth)}\n"
+            # #     f"  wave length L   :{L:6.1f} m\n"
+            # #     f"  wave velocity C :{C:6.1f} m/s\n"
+            # #     f"\n"
+            # #     f"Target : N {x:6.1f} | E {y:6.1f} | D {z:6.1f} m\n"
+            # #     f"Wave   : N {x:6.1f} | E {y:6.1f} | D {uuv_wave_h:6.1f} m\n"
+            # #     )
+            # # plotter.add_text(
+            # #     global_msg, 
+            # #     position='upper_left', 
+            # #     font_size=12,       # 字体大小
+            # #     color='white',      # 字体颜色
+            # #     font='courier',     # 使用等宽字体，数字不跳动
+            # #     name='hud_status',  # [关键] 设置固定名字，实现更新而非覆盖
+            # #     shadow=True         # 添加阴影，在浅色背景下也能看清
+            # # )
+
+            # # --- HUD 更新逻辑结束 ---
+
+            # plotter.write_frame()
+            plotter.render()
+
+
+            # ==================== [核心修改] 截图与拼接 ====================
+            
+            # A. 获取 3D 渲染图像 (numpy array)
+            # return_img=True 返回的是 RGB 数组
+            img_3d = plotter.screenshot(transparent_background=False, return_img=True)
+            
+            # PyVista 返回 RGB，OpenCV 需要 BGR
+            if img_3d is None: continue # 防止空帧
+            img_3d_bgr = cv2.cvtColor(img_3d, cv2.COLOR_RGB2BGR)
+
+            # B. 创建画布 (黑色背景)
+            # 形状是 (Height, Width, 3)
+            canvas = np.zeros((total_height, total_width, 3), dtype=np.uint8)
+            
+            # C. 贴上 3D 图像 (放在左边)
+            # 注意：截图尺寸可能与 window_size 不完全一致（受系统缩放影响），需要 resize
+            if img_3d_bgr.shape[:2] != (render_height, render_width):
+                img_3d_bgr = cv2.resize(img_3d_bgr, (render_width, render_height))
+            
+            canvas[0:render_height, sidebar_width:render_width+sidebar_width] = img_3d_bgr
+
+            # D. 在右侧黑色区域写字
             curr_t = t_vals[frame_idx]
             uuv_wave_h = uuv_wave_heights_array[frame_idx]
             
-            vx=vx_vals[frame_idx]
-            vy=vy_vals[frame_idx]
-            vz=vz_vals[frame_idx]
-            u=u_vals[frame_idx]
-            v=v_vals[frame_idx]
-            w=w_vals[frame_idx]
-            p=p_vals[frame_idx]*57.3
-            q=q_vals[frame_idx]*57.3
-            r=r_vals[frame_idx]*57.3
-            
             hud_text = (
-                f"Local View (Follow)\n"
                 f"TIME : {curr_t:06.2f} s\n"
-                f"---------------------\n"
-                f"World_Pos     : N {x:6.1f} | E {y:6.1f} | D {z:6.1f} m\n"
-                f"World_Speed   : N {vx:6.1f} | E {vy:6.1f} | D {vz:6.1f} m\n"
                 f"\n"
-                f"Wave_Pos      : N {x:6.1f} | E {y:6.1f} | D {uuv_wave_h:6.1f} m\n"
-                f"Self_Pos      : N {x:6.1f} | E {y:6.1f} | D {z:6.1f} m\n"
+                f"--- Position (Global) ---\n"
+                f"N (x)       : {x:6.2f} m\n"
+                f"E (y)       : {y:6.2f} m\n"
+                f"D (z)       : {z:6.2f} m\n"
+                f"wave height : {uuv_wave_h:6.2f} m\n"
                 f"\n"
-                f"Self_Deg      : R {np.degrees(phi):6.1f} | P {np.degrees(theta):6.1f} | Y {np.degrees(psi):6.1f} deg\n"
+                f"--- Attitude (Deg) ---\n"
+                f"Roll  : {np.degrees(phi):6.1f}\n"
+                f"Pitch : {np.degrees(theta):6.1f}\n"
+                f"Yaw   : {np.degrees(psi):6.1f}\n"
                 f"\n"
-                f"Self_Speed    : u {u:6.1f} | v {v:6.1f} | w {w:6.1f} m/s\n"
-                f"Self_Speed_Deg: p {p:6.1f} | q {q:6.1f} | r {r:6.1f} deg/s\n"
-                f"---------------------\n"
+                f"--- Velocity (Global) ---\n"
+                f"Vx    : {vx_vals[frame_idx]:6.1f} m/s\n"
+                f"Vy    : {vy_vals[frame_idx]:6.1f} m/s\n"
+                f"Vz    : {vz_vals[frame_idx]:6.1f} m/s\n"
+                f"\n"
+                f"--- Body Rates ---\n"
+                f"p     : {uuv_trace['p'].iloc[frame_idx]*57.3:6.1f} d/s\n"
+                f"q     : {uuv_trace['q'].iloc[frame_idx]*57.3:6.1f} d/s\n"
+                f"r     : {uuv_trace['r'].iloc[frame_idx]*57.3:6.1f} d/s\n"
+                f"\n"
+                f"--- Wave Info ---\n"
+                f"Hs               : {self.Hs:6.1f} m\n"
+                f"T1               : {self.T1:6.1f} m\n"
+                f"main_theta       : {self.main_theta*180/pi:6.1f} d\n"
+                f"wave_type        : {str(wp_type)}\n"
+                f"water depth      : {str(self.water_depth)}\n"
+                f"wave length L    : {L:6.1f} m\n"
+                f"wave velocity C  : {C:6.1f} m/s\n"
+
             )
             
-            # 3. 添加到左侧视图 (subplot 0)
-            plotter.subplot(0, 0)
-            plotter.add_text(
-                hud_text, 
-                position='upper_left', 
-                font_size=12,       # 字体大小
-                color='white',      # 字体颜色
-                font='courier',     # 使用等宽字体，数字不跳动
-                name='hud_status',  # [关键] 设置固定名字，实现更新而非覆盖
-                shadow=True         # 添加阴影，在浅色背景下也能看清
-            )
-            
-            # (可选) 在右侧全局视图显示简略信息
-            plotter.subplot(0, 1)
-            global_msg = (
-                f"Global View\n"
-                f"---------------------\n"
-                f"Wave_Params:\n"
-                f"  Hs              :{wp_Hs:6.1f} m\n"
-                f"  T1              :{wp_T1:6.1f} s\n"
-                f"  main_theta      :{wp_theta:6.1f} deg\n"
-                f"  wave_type       :{str(wp_type)}\n"
-                f"  water depth     :{str(self.water_depth)}\n"
-                f"  wave length L   :{L:6.1f} m\n"
-                f"  wave velocity C :{C:6.1f} m/s\n"
-                f"\n"
-                f"Target : N {x:6.1f} | E {y:6.1f} | D {z:6.1f} m\n"
-                f"Wave   : N {x:6.1f} | E {y:6.1f} | D {uuv_wave_h:6.1f} m\n"
-                )
-            plotter.add_text(
-                global_msg, 
-                position='upper_left', 
-                font_size=12,       # 字体大小
-                color='white',      # 字体颜色
-                font='courier',     # 使用等宽字体，数字不跳动
-                name='hud_status',  # [关键] 设置固定名字，实现更新而非覆盖
-                shadow=True         # 添加阴影，在浅色背景下也能看清
-            )
+            # 文字配置
+            text_x = 20
+            text_y = 20
+            put_multiline_text(canvas, hud_text, (text_x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, 23)
 
-            # --- HUD 更新逻辑结束 ---
-
-            plotter.write_frame()
+            # E. 写入视频
+            out_video.write(canvas)
 
         plotter.close()
+        out_video.release()
         # print(f"视频已保存至: {self.moviepath}")
 
 
@@ -1725,6 +1843,16 @@ class UnderwaterVehicle:
 m = 50
 # length, width, height = 0.56, 0.42, 0.42
 length, width, height = 1, 0.28, 0.28
+
+
+# m = 1000
+# # length, width, height = 0.56, 0.42, 0.42
+# length, width, height = 4, 0.6, 0.6
+
+# rho g V = 1000 * 9.8 * 4 * 0.6 * 0.6 = 14112
+# m<1440
+
+
 d_uuv=0.01
 
 # m = 500
@@ -1761,18 +1889,6 @@ wave_type='JONSWAP'
 omega_min = 0.1
 omega_max = 3.0
 
-range_max=10
-dd=0.1
-x_range=[-range_max,range_max]
-y_range=[-range_max,range_max]
-dx=dd
-dy=dd
-
-global_x_range = [-range_max*3, range_max*3]  # 更大的X范围
-global_y_range = [-range_max*3, range_max*3]  # 更大的Y范围
-global_dx = dd*10  # 更大的网格间距
-global_dy = dd*10
-
 off_screen=True
 
 cube_center = [0, 0, 0]  # 初始中心位置
@@ -1801,7 +1917,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="接收参数")
     parser.add_argument("--Hs", type=float, default=1.5, help="Hs")
-    parser.add_argument("--T1", type=float, default=5, help="T1")
+    parser.add_argument("--T1", type=float, default=8, help="T1")
     parser.add_argument("--main_theta", type=float, default=0, help="main_theta")
 
     parser.add_argument("--tau_x0", type=float, default=0, help="tau_x0")
@@ -1816,11 +1932,12 @@ def main():
 
     Hs=args.Hs
     T1=args.T1
-    main_theta=args.main_theta
+    main_theta=args.main_theta/180*pi
     tau_x0=args.tau_x0
     t_max=args.t_max
 
 
+    # folder=f"./仿真/"+args.group +"/"
     folder=f"./仿真/"+args.group +"/"
     if not os.path.exists(folder):
         # os.makedirs() 递归创建多级目录（若「仿真」目录也不存在，会一并创建）
@@ -1844,7 +1961,7 @@ def main():
                                 X_u_absu, Y_v_absv, Z_w_absw, K_p_absp, M_q_absq, N_r_absr,
                                 
                                 d_uuv,Hs,T1,wave_N,wave_M,s,wave_type,main_theta,current_force_mag,current_angle,water_depth,
-                                omega_min, omega_max, x_range, y_range, dx, dy,global_x_range, global_y_range, global_dx, global_dy,
+                                omega_min, omega_max,
                                 off_screen, cube_center, moviepath)
 
     # try:
